@@ -38,3 +38,16 @@ struct surface_keyboard_key_message {
 };
 
 bool decode_surface_keyboard_key_message(struct dart_value *value, struct surface_keyboard_key_message *out);
+
+struct surface_toplevel_set_maximized_message {
+    uint32_t surface_handle;
+    int64_t maximized;
+};
+
+bool decode_surface_toplevel_set_maximized_message(struct dart_value *value, struct surface_toplevel_set_maximized_message *out);
+
+struct surface_toplevel_close_message {
+    uint32_t surface_handle;
+};
+
+bool decode_surface_toplevel_close_message(struct dart_value *value, struct surface_toplevel_close_message *out);

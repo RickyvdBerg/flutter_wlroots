@@ -163,6 +163,14 @@ static void engine_cb_platform_message(
       fwr_handle_surface_toplevel_set_size(instance, engine_message->response_handle, &args);
       return;
     }
+    if (strcmp(method_name, "surface_toplevel_set_maximized") == 0) {
+      fwr_handle_surface_toplevel_set_maximized(instance, engine_message->response_handle, &args);
+      return;
+    }
+    if (strcmp(method_name, "surface_toplevel_close") == 0) {
+      fwr_handle_surface_toplevel_close(instance, engine_message->response_handle, &args);
+      return;
+    }
 
     if (strcmp(method_name, "is_compositor") == 0) {
       // Just send a success response.

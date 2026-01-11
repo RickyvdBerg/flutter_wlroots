@@ -8,7 +8,10 @@ endif
 
 embedder_dep = subproject('flutter_embedder').get_variable('embedder_dep')
 
-wlroots_dep = subproject('wlroots', default_options: 'examples=false').get_variable('wlroots')
+wlroots_dep = subproject(
+  'wlroots',
+  default_options: ['examples=false', 'werror=false'],
+).get_variable('wlroots')
 
 threads_dep = dependency('threads')
 

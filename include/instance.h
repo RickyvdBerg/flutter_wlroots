@@ -101,6 +101,8 @@ struct fwr_view {
   struct wl_listener unmap;
   struct wl_listener destroy;
   struct wl_listener commit;
+  struct wl_listener set_title;
+  struct wl_listener set_app_id;
 };
 
 struct fwr_keyboard {

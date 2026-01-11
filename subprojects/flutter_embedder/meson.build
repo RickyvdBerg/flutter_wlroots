@@ -6,7 +6,7 @@ embedder_commit = get_option('engine_commit')
 # https://storage.googleapis.com/flutter_infra_release/flutter/<COMMIT>/linux-x64/linux-x64-embedder
 embedder_sha256 = get_option('engine_embedder_hash')
 
-embedder_archive_url = 'https://storage.googleapis.com/flutter_infra_release/flutter/' + embedder_commit + '/linux-x64/linux-x64-embedder'
+embedder_archive_url = 'https://storage.googleapis.com/flutter_infra_release/flutter/' + embedder_commit + '/linux-x64/linux-x64-embedder.zip'
 embedder_archive_path = 'linux-x64-embedder.zip'
 embedder_path = 'linux-x64-embedder'
 

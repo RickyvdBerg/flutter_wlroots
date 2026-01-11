@@ -1,4 +1,5 @@
 #include "flutter_wlroots.h"
+#include <stdio.h>
 
 int main(int argc, const char *const argv[]) {
     struct fwr_instance_opts opts = {};

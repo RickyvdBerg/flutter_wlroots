@@ -23,12 +23,17 @@ class Surface {
 
   final Compositor compositor;
 
+  String? title;
+  String? appId;
+
   Surface({
     required this.handle,
     required this.pid,
     required this.gid,
     required this.uid,
     required this.compositor,
+    this.title,
+    this.appId,
   });
 }
 
@@ -64,6 +69,17 @@ class _CompositorPlatform {
 
   Future<void> surfaceToplevelSetSize(Surface surface, int width, int height) async {
     await channel.invokeListMethod("surface_toplevel_set_size", [surface.handle, width, height]);
+  }
+
+  Future<void> surfaceToplevelSetMaximized(Surface surface, bool maximized) async {
+    await channel.invokeListMethod(
+      "surface_toplevel_set_maximized",
+      [surface.handle, maximized ? 1 : 0],
+    );
+  }
+
+  Future<void> surfaceToplevelClose(Surface surface) async {
+    await channel.invokeListMethod("surface_toplevel_close", [surface.handle]);
   }
 
   Future<void> clearFocus(Surface surface) async {
@@ -113,6 +129,7 @@ class Compositor {
   // Emits an event when a surface has been added and is ready to be presented on the screen.
   StreamController<Surface> surfaceMapped = StreamController.broadcast();
   StreamController<Surface> surfaceUnmapped = StreamController.broadcast();
+  StreamController<Surface> surfaceUpdated = StreamController.broadcast();
 
   int? keyToXkb(int physicalKey) => physicalToXkbMap[physicalKey];
 
@@ -124,6 +141,8 @@ class Compositor {
         gid: call.arguments["client_gid"],
         uid: call.arguments["client_uid"],
         compositor: this,
+        title: call.arguments["title"],
+        appId: call.arguments["app_id"],
       );
       surfaces[surface.handle] = surface;
       surfaceMapped.add(surface);
@@ -134,6 +153,15 @@ class Compositor {
       Surface surface = surfaces[handle]!;
       surfaces.remove(handle);
       surfaceUnmapped.add(surface);
+    });
+
+    platform.addHandler("surface_title", (call) async {
+      int handle = call.arguments["handle"];
+      Surface? surface = surfaces[handle];
+      if (surface == null) return;
+      surface.title = call.arguments["title"];
+      surface.appId = call.arguments["app_id"];
+      surfaceUpdated.add(surface);
     });
 
     platform.addHandler("flutter/keyevent", (call) async {});
