@@ -1,11 +1,9 @@
 #include "flutter_embedder.h"
 #include "renderer.h"
 #include "standard_message_codec.h"
-#include "xdg-shell-protocol.h"
 
 #include <bits/pthreadtypes.h>
 #include <bits/types.h>
-#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,6 +31,7 @@
 #include <wlr/types/wlr_data_device.h>
 #include <wlr/types/wlr_output_layout.h>
 #include <wlr/types/wlr_xdg_shell.h>
+#include <wlr/types/wlr_xdg_decoration_v1.h>
 #include <wlr/types/wlr_cursor.h>
 #include <wlr/types/wlr_xcursor_manager.h>
 #include <wlr/types/wlr_matrix.h>
@@ -48,6 +47,7 @@
 #include "output.h"
 #include "surface.h"
 #include "platform_channel.h"
+#include "text_input.h"
 
 //#define eglGetProcAddr eglGetProcAddress
 //#define __glintercept_log(...) wlr_log(WLR_INFO, __VA_ARGS__)
@@ -59,6 +59,19 @@
     wlr_log(WLR_ERROR, "GL ERROR: %d", err);\
   }\
 } while (0)
+
+// Handler for new xdg-decoration requests - tell apps to use server-side decorations
+static void handle_new_toplevel_decoration(struct wl_listener *listener, void *data) {
+  struct fwr_instance *instance =
+      wl_container_of(listener, instance, new_toplevel_decoration);
+  struct wlr_xdg_toplevel_decoration_v1 *decoration = data;
+  
+  // Tell the client to use server-side decorations (we provide the title bar)
+  wlr_xdg_toplevel_decoration_v1_set_mode(decoration,
+      WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+  
+  wlr_log(WLR_INFO, "Set server-side decorations for surface");
+}
 
 static bool engine_cb_renderer_make_current(void *user_data) {
   struct fwr_instance *instance = user_data;
@@ -181,7 +194,7 @@ static void engine_cb_platform_message(
     }
 
     if (strcmp(method_name, "get_socket_paths") == 0) {
-      platch_respond_success_std(instance, engine_message->response_handle, &(struct std_value) {
+      platch_respond_success_std(instance, (FlutterPlatformMessageResponseHandle *)engine_message->response_handle, &(struct std_value) {
         .type = kStdMap,
         .size = 2,
         .keys = (struct std_value[2]) {
@@ -314,6 +327,11 @@ bool fwr_instance_create(struct fwr_instance_opts opts, struct fwr_instance **in
   instance->new_xdg_surface.notify = fwr_new_xdg_surface;
   wl_signal_add(&instance->xdg_shell->events.new_surface, &instance->new_xdg_surface);
 
+  // xdg-decoration: tell apps to use server-side decorations (we provide title bars)
+  instance->decoration_manager = wlr_xdg_decoration_manager_v1_create(instance->wl_display);
+  instance->new_toplevel_decoration.notify = handle_new_toplevel_decoration;
+  wl_signal_add(&instance->decoration_manager->events.new_toplevel_decoration, &instance->new_toplevel_decoration);
+
   fwr_input_init(instance);
 
   const char *socket = wl_display_add_socket_auto(instance->wl_display);
@@ -377,7 +395,7 @@ bool fwr_instance_create(struct fwr_instance_opts opts, struct fwr_instance **in
 
     FlutterEngineResult engine_result = FlutterEngineCreateAOTData(&aot_source, &aot_data);
     if (engine_result != kSuccess) {
-     wlr_log(WLR_ERROR, "Could not load AOT data. FlutterEngineCreateAOTData: %s\n");
+     wlr_log(WLR_ERROR, "Could not load AOT data. FlutterEngineCreateAOTData failed.");
      return false;
     }
 
@@ -386,8 +404,7 @@ bool fwr_instance_create(struct fwr_instance_opts opts, struct fwr_instance **in
   }
 
   fwr_plugin_registry_init(&instance->plugin_registry);
-  //#ifdef FWR_BUILTIN_PLUGIN_TEXT_INPUT
-  //#endif // FWR_BUILTIN_PLUGIN_TEXT_INPUT
+  fwr_text_input_init(instance);
 
   wlr_log(WLR_INFO, "Pre engine run");
   FlutterEngineResult fl_result = instance->fl_proc_table.Run(

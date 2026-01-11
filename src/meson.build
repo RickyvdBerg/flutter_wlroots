@@ -11,6 +11,7 @@ fwr_src += files(
     'surface.c',
     'platform_channel.c',
     'plugin_registry.c',
+    'text_input.c',
 )
 
 

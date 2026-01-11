@@ -15,6 +15,9 @@
 #include "handle_map.h"
 #include "plugin_registry.h"
 
+struct wlr_xdg_decoration_manager_v1;
+struct wlr_xdg_toplevel_decoration_v1;
+
 struct fwr_instance {
   struct wl_display *wl_display;
   struct wl_event_loop *wl_event_loop;
@@ -28,6 +31,9 @@ struct fwr_instance {
 
   struct wlr_xdg_shell *xdg_shell;
   struct wl_listener new_xdg_surface;
+
+  struct wlr_xdg_decoration_manager_v1 *decoration_manager;
+  struct wl_listener new_toplevel_decoration;
 
   // Map of `uint32_t handle` => `struct fwr_view view`
   struct handle_map *views;

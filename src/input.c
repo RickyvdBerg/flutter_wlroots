@@ -29,7 +29,7 @@
 #include "constants.h"
 #include "handle_map.h"
 #include "messages.h"
-#include "platform_channel.h"
+#include "text_input.h"
 
 #define NS_PER_MS 1000000
 
@@ -151,9 +151,11 @@ static void on_server_cursor_frame(struct wl_listener *listener, void *data) {
   pointer_event.x = instance->cursor->x;
   pointer_event.y = instance->cursor->y;
   pointer_event.device = 0;
-  pointer_event.signal_kind = kFlutterPointerSignalKindNone;
   pointer_event.scroll_delta_x = instance->input.acc_scroll_delta_x;
   pointer_event.scroll_delta_y = instance->input.acc_scroll_delta_y;
+  pointer_event.signal_kind = (pointer_event.scroll_delta_x != 0 || pointer_event.scroll_delta_y != 0)
+      ? kFlutterPointerSignalKindScroll
+      : kFlutterPointerSignalKindNone;
   pointer_event.device_kind = kFlutterPointerDeviceKindMouse;
   pointer_event.buttons = curr_mask;
   // TODO this is not 100% right as we should return the timestamp from libinput.
@@ -272,52 +274,24 @@ static void on_server_cursor_touch_frame(struct wl_listener *listener, void *dat
   struct fwr_instance *instance = wl_container_of(listener, instance, cursor_touch_frame);
 }
 
-static void cb(const uint8_t *data, size_t size, void *user_data) {
-  wlr_log(WLR_INFO, "callback");
+static uint64_t scancode_to_physical_key(uint32_t scancode) {
+  return 0x00070000 | scancode;
 }
 
-static inline bool keyboard_state_is_ctrl_active(struct xkb_state *state) {
-  return xkb_state_mod_name_is_active(state, XKB_MOD_NAME_CTRL, XKB_STATE_MODS_EFFECTIVE);
+static uint64_t xkb_keysym_to_logical_key(xkb_keysym_t keysym, uint32_t unicode) {
+  if (unicode >= 0x20 && unicode <= 0x7e) {
+    return unicode | 0x00000000;
+  }
+  if (unicode > 0 && unicode < 0x10FFFF) {
+    return unicode | 0x00000000;
+  }
+  return keysym | 0x01000000000;
 }
-
-static inline bool keyboard_state_is_shift_active(struct xkb_state *state) {
-  return xkb_state_mod_name_is_active(state, XKB_MOD_NAME_SHIFT, XKB_STATE_MODS_EFFECTIVE);
-}
-
-static inline bool keyboard_state_is_alt_active(struct xkb_state *state) {
-  return xkb_state_mod_name_is_active(state, XKB_MOD_NAME_ALT, XKB_STATE_MODS_EFFECTIVE);
-}
-
-static inline bool keyboard_state_is_meta_active(struct xkb_state *state) {
-  return xkb_state_mod_name_is_active(state, XKB_MOD_NAME_LOGO, XKB_STATE_MODS_EFFECTIVE);
-}
-
-static inline bool keyboard_state_is_capslock_active(struct xkb_state *state) {
-  return xkb_state_mod_name_is_active(state, XKB_MOD_NAME_CAPS, XKB_STATE_MODS_EFFECTIVE);
-}
-
-static inline bool keyboard_state_is_numlock_active(struct xkb_state *state) {
-  return xkb_state_mod_name_is_active(state, XKB_MOD_NAME_NUM, XKB_STATE_MODS_EFFECTIVE);
-}
-
-static inline bool keyboard_state_is_scrolllock_active(struct xkb_state *state) {
-  return xkb_state_mod_name_is_active(state, "Mod3", XKB_STATE_MODS_EFFECTIVE);
-}
-
 
 static void send_key_to_flutter(struct fwr_keyboard *keyboard, struct wlr_event_keyboard_key *event) {
   struct fwr_instance *instance = keyboard->instance;
 
-  FlutterPlatformMessageResponseHandle *response_handle;
-  instance->fl_proc_table.PlatformMessageCreateResponseHandle(instance->engine, cb, NULL, &response_handle);
-
   struct xkb_state *kb_state = keyboard->device->keyboard->xkb_state;
-  uint32_t modifiers = keyboard_state_is_shift_active(kb_state)
-        | (keyboard_state_is_capslock_active(kb_state) << 1)
-        | (keyboard_state_is_ctrl_active(kb_state) << 2)
-        | (keyboard_state_is_alt_active(kb_state) << 3)
-        | (keyboard_state_is_numlock_active(kb_state) << 4)
-        | (keyboard_state_is_meta_active(kb_state) << 28);
   uint16_t scan_code = (uint16_t)event->keycode + 8;
   xkb_keysym_t key_code = xkb_state_key_get_one_sym(kb_state, scan_code);
   uint32_t unicode = xkb_state_key_get_utf32(kb_state, scan_code);
@@ -327,62 +301,50 @@ static void send_key_to_flutter(struct fwr_keyboard *keyboard, struct wlr_event_
   if (feed_result == XKB_COMPOSE_FEED_ACCEPTED && compose_status == XKB_COMPOSE_COMPOSING) {
     key_code = XKB_KEY_NoSymbol;
   }
-        
+
   if (compose_status == XKB_COMPOSE_COMPOSED) {
     key_code = xkb_compose_state_get_one_sym(keyboard->compose_state);
+    unicode = xkb_keysym_to_utf32(key_code);
     xkb_compose_state_reset(keyboard->compose_state);
   } else if (compose_status == XKB_COMPOSE_CANCELLED) {
     xkb_compose_state_reset(keyboard->compose_state);
   }
 
-  char *type;
   FlutterKeyEventType flType;
-
   switch(event->state) {
     case WL_KEYBOARD_KEY_STATE_PRESSED:
-      type = "keydown";
       flType = kFlutterKeyEventTypeDown;
       break;
     case WL_KEYBOARD_KEY_STATE_RELEASED:
     default:
-      type = "keyup";
       flType = kFlutterKeyEventTypeUp;
       break;
   }
 
-  platch_send(
-    instance,
-    "flutter/keyevent",
-    &(struct platch_obj) {
-      .codec = kJSONMessageCodec,
-      .json_value = {
-        .type = kJsonObject,
-        .size = 7,
-        .keys = (char*[7]) {
-          "keymap",
-          "toolkit",
-          "unicodeScalarValues",
-          "keyCode",
-          "scanCode",
-          "modifiers",
-          "type"
-        },
-        .values = (struct json_value[7]) {
-          /* keymap */                {.type = kJsonString, .string_value = "linux"},
-          /* toolkit */               {.type = kJsonString, .string_value = "gtk"},
-          /* unicodeScalarValues */   {.type = kJsonNumber, .number_value = (flType == kFlutterKeyEventTypeDown ? unicode : 0x0)},
-          /* keyCode */               {.type = kJsonNumber, .number_value = (uint32_t) key_code},
-          /* scanCode */              {.type = kJsonNumber, .number_value = scan_code},
-          /* modifiers */             {.type = kJsonNumber, .number_value = modifiers},
-          /* type */                  {.type = kJsonString, .string_value = type}
-        }
-      }
-    },
-    kJSONMessageCodec,
-    NULL,
-    NULL
-  );
-  //instance->fl_proc_table.SendPlatformMessage(instance->engine, &platform_message);
+  static char character_buf[8];
+  char *character = NULL;
+  if (flType == kFlutterKeyEventTypeDown && unicode > 0) {
+    int len = xkb_keysym_to_utf8(key_code, character_buf, sizeof(character_buf));
+    if (len > 0) {
+      character_buf[len] = '\0';
+      character = character_buf;
+    }
+  }
+
+  FlutterKeyEvent fl_event = {
+    .struct_size = sizeof(FlutterKeyEvent),
+    .timestamp = (double)instance->fl_proc_table.GetCurrentTime() / 1000.0,
+    .type = flType,
+    .physical = scancode_to_physical_key(event->keycode),
+    .logical = xkb_keysym_to_logical_key(key_code, unicode),
+    .character = character,
+    .synthesized = false,
+    .device_type = kFlutterKeyEventDeviceTypeKeyboard,
+  };
+
+  instance->fl_proc_table.SendKeyEvent(instance->engine, &fl_event, NULL, NULL);
+
+  fwr_text_input_handle_key(instance, key_code, unicode, flType == kFlutterKeyEventTypeDown);
 }
 
 static void keyboard_handle_modifiers(struct wl_listener *listener, void *data) {

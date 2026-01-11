@@ -47,8 +47,9 @@ int fwr_plugin_registry_register(struct fwr_plugin_registry *registry, struct fw
         registry->plugins = new_plugins;
     }
 
+    size_t plugin_index = registry->plugins_len;
     registry->plugins_len += 1;
-    struct fwr_plugin* plugin = &registry->plugins[registry->plugins_len];
+    struct fwr_plugin* plugin = &registry->plugins[plugin_index];
 
     plugin->id = registry->next_id++;
     plugin->data = data;
@@ -76,8 +77,9 @@ int fwr_plugin_registry_channel_handler_register(struct fwr_plugin_registry *reg
         registry->plugin_channel_handlers = new_handlers;
     }
 
+    size_t handler_index = registry->plugin_channel_handlers_len;
     registry->plugin_channel_handlers_len += 1;
-    struct fwr_plugin_channel_handler* handler = &registry->plugin_channel_handlers[registry->plugin_channel_handlers_len];
+    struct fwr_plugin_channel_handler* handler = &registry->plugin_channel_handlers[handler_index];
 
     handler->id = registry->next_id++;
     handler->data = data;
