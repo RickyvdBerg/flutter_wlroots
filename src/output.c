@@ -1,6 +1,7 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <time.h>
 
 #include <wayland-server-core.h>
 #include <wayland-util.h>
@@ -11,6 +12,8 @@
 #include <wlr/types/wlr_output_layout.h>
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/types/wlr_scene.h>
+#include <wlr/types/wlr_compositor.h>
+#include <wlr/types/wlr_xdg_shell.h>
 #include <wlr/render/pass.h>
 
 #include "renderer.h"
@@ -20,6 +23,7 @@ static void output_frame(struct wl_listener *listener, void *data) {
   struct fwr_instance *instance = output->instance;
   struct wlr_output *wlr_output = output->wlr_output;
 
+  // Handle vsync baton for Flutter frame pacing
   intptr_t baton = atomic_exchange(&instance->vsync_baton, 0);
   if (baton != 0) {
     uint64_t current_time = instance->fl_proc_table.GetCurrentTime();
@@ -32,24 +36,54 @@ static void output_frame(struct wl_listener *listener, void *data) {
     wlr_log(WLR_DEBUG, "Returning baton");
   }
 
-  struct wlr_scene_output *scene_output = output->scene_output;
-  if (scene_output == NULL && instance->scene != NULL) {
-    scene_output = wlr_scene_get_scene_output(instance->scene, wlr_output);
-  }
+  // Begin render pass - Flutter-centric compositing
+  // Flutter renders everything: decorations + Wayland surfaces via platform views
+  struct wlr_output_state output_state;
+  wlr_output_state_init(&output_state);
 
-  if (scene_output == NULL) {
+  struct wlr_render_pass *render_pass = wlr_output_begin_render_pass(
+      wlr_output, &output_state, NULL, NULL);
+  
+  if (render_pass == NULL) {
+    wlr_output_state_finish(&output_state);
     goto out;
   }
 
-  fwr_renderer_update_scene_buffer(instance);
+  // Clear to dark background (Flutter will draw over this)
+  wlr_render_pass_add_rect(render_pass, &(struct wlr_render_rect_options){
+    .box = { .x = 0, .y = 0, .width = wlr_output->width, .height = wlr_output->height },
+    .color = { 0.1f, 0.1f, 0.1f, 1.0f },
+  });
 
-  if (!wlr_scene_output_commit(scene_output, NULL)) {
+  // Update scene node positions for input hit-testing
+  // (Scene nodes are still used for hit-testing even though we render directly)
+  fwr_renderer_update_scene_positions(instance);
+
+  // Render the Flutter scene directly (GPU textures + platform views)
+  // This is the Flutter-centric path: NO CPU READBACK
+  fwr_renderer_render_scene(instance, render_pass);
+
+  // Submit render pass
+  if (!wlr_render_pass_submit(render_pass)) {
+    wlr_output_state_finish(&output_state);
     goto out;
   }
 
+  // Commit the output
+  wlr_output_commit_state(wlr_output, &output_state);
+  wlr_output_state_finish(&output_state);
+
+  // Send frame done to Wayland surfaces
   struct timespec now;
   clock_gettime(CLOCK_MONOTONIC, &now);
-  wlr_scene_output_send_frame_done(scene_output, &now);
+  
+  // Notify surfaces that the frame is done
+  struct fwr_view *view;
+  wl_list_for_each(view, &instance->views_list, link) {
+    if (view->xdg_surface != NULL && view->xdg_surface->surface != NULL) {
+      wlr_surface_send_frame_done(view->xdg_surface->surface, &now);
+    }
+  }
 
 out:
   wlr_output_schedule_frame(wlr_output);

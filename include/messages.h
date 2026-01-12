@@ -64,3 +64,11 @@ struct surface_begin_resize_message {
 };
 
 bool decode_surface_begin_resize_message(struct dart_value *value, struct surface_begin_resize_message *out);
+
+struct surface_set_position_message {
+    uint32_t surface_handle;
+    int64_t x;
+    int64_t y;
+};
+
+bool decode_surface_set_position_message(struct dart_value *value, struct surface_set_position_message *out);

@@ -133,6 +133,10 @@ class _CompositorPlatform {
     await channel.invokeListMethod("surface_begin_resize", [surface.handle, edges]);
   }
 
+  Future<void> surfaceSetPosition(Surface surface, int x, int y) async {
+    await channel.invokeListMethod("surface_set_position", [surface.handle, x, y]);
+  }
+
   Future<void> surfaceSendKey(Surface surface, int keycode, KeyStatus status, Duration timestamp) async {
     await channel.invokeListMethod(
       "surface_keyboard_key",

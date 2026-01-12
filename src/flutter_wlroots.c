@@ -189,6 +189,10 @@ static void engine_cb_platform_message(
       fwr_handle_surface_begin_resize(instance, engine_message->response_handle, &args);
       return;
     }
+    if (strcmp(method_name, "surface_set_position") == 0) {
+      fwr_handle_surface_set_position(instance, engine_message->response_handle, &args);
+      return;
+    }
     if (strcmp(method_name, "surface_pointer_event") == 0) {
       fwr_handle_surface_pointer_event_message(instance, engine_message->response_handle, &args);
       return;
@@ -453,7 +457,10 @@ bool fwr_instance_create(struct fwr_instance_opts opts, struct fwr_instance **in
     window_metrics.struct_size = sizeof(FlutterWindowMetricsEvent);
     window_metrics.width = instance->output->wlr_output->width;
     window_metrics.height = instance->output->wlr_output->height;
-    window_metrics.pixel_ratio = 1.0;
+    // Keep Flutter's coordinate space consistent with wlroots output scale.
+    // Setting this incorrectly can produce fractional layer offsets and
+    // transform translations that don't match (visible as subtle desync/jitter).
+    window_metrics.pixel_ratio = instance->output->wlr_output->scale;
     instance->fl_proc_table.SendWindowMetricsEvent(instance->engine, &window_metrics);
   }
 

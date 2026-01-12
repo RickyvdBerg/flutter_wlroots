@@ -457,3 +457,35 @@ error:
   wlr_log(WLR_ERROR, "Invalid surface focus message");
   instance->fl_proc_table.SendPlatformMessageResponse(instance->engine, handle, NULL, 0);
 }
+
+void fwr_handle_surface_set_position(
+    struct fwr_instance *instance,
+    const FlutterPlatformMessageResponseHandle *handle,
+    struct dart_value *args) {
+  struct surface_set_position_message message;
+  if (!decode_surface_set_position_message(args, &message)) {
+    goto error;
+  }
+
+  struct fwr_view *view;
+  if (!handle_map_get(instance->views, message.surface_handle, (void**)&view)) {
+    goto success;
+  }
+
+  // Update position (Dart is source of truth for window positioning)
+  view->x = (int)message.x;
+  view->y = (int)message.y;
+
+  // Update scene tree position for input hit-testing
+  if (view->scene_tree != NULL) {
+    wlr_scene_node_set_position(&view->scene_tree->node, view->x, view->y);
+  }
+
+success:
+  instance->fl_proc_table.SendPlatformMessageResponse(instance->engine, handle, method_call_null_success, sizeof(method_call_null_success));
+  return;
+
+error:
+  wlr_log(WLR_ERROR, "Invalid surface set position message");
+  instance->fl_proc_table.SendPlatformMessageResponse(instance->engine, handle, NULL, 0);
+}

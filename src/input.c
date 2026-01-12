@@ -23,6 +23,7 @@
 #include <xkbcommon/xkbcommon-compose.h>
 #include <xkbcommon/xkbcommon-keysyms.h>
 #include <stdlib.h>
+#include <math.h>
 #include <locale.h>
 
 #include "input.h"
@@ -104,6 +105,9 @@ static struct hit_test_result hit_test_cursor(struct fwr_instance *instance) {
   res.ny = ny;
 
   if (node == NULL) {
+    // No scene node hit - this means we're over the Flutter shell background
+    // Flutter renders everything, so if no Wayland surface is hit, Flutter gets the event
+    res.is_flutter = true;
     return res;
   }
 
@@ -844,18 +848,36 @@ void fwr_handle_surface_pointer_event_message(
 
   uint32_t time_msec = (uint32_t)(message.timestamp / 1000);
 
+  // If we temporarily scale the client buffer during interactive resize to
+  // match the Flutter widget size, we must also scale pointer coordinates back
+  // into the surface's current coordinate space so hit-testing stays correct.
+  double local_x = message.local_pos_x;
+  double local_y = message.local_pos_y;
+  if (message.widget_size_x > 0.0 && message.widget_size_y > 0.0) {
+    int surf_w = surface->current.width;
+    int surf_h = surface->current.height;
+    if (surf_w > 0 && surf_h > 0) {
+      double sx = (double)surf_w / message.widget_size_x;
+      double sy = (double)surf_h / message.widget_size_y;
+      if (isfinite(sx) && isfinite(sy) && sx > 0.0 && sy > 0.0) {
+        local_x *= sx;
+        local_y *= sy;
+      }
+    }
+  }
+
   if (message.event_type == pointerEnterEvent) {
-    wlr_seat_pointer_notify_enter(instance->seat, surface, message.local_pos_x, message.local_pos_y);
+    wlr_seat_pointer_notify_enter(instance->seat, surface, local_x, local_y);
     wlr_seat_pointer_notify_frame(instance->seat);
   } else if (message.event_type == pointerExitEvent) {
     wlr_seat_pointer_clear_focus(instance->seat);
     injected_clear_pointer(message.pointer);
   } else if (message.event_type == pointerHoverEvent || message.event_type == pointerMoveEvent) {
-    wlr_seat_pointer_notify_enter(instance->seat, surface, message.local_pos_x, message.local_pos_y);
-    wlr_seat_pointer_notify_motion(instance->seat, time_msec, message.local_pos_x, message.local_pos_y);
+    wlr_seat_pointer_notify_enter(instance->seat, surface, local_x, local_y);
+    wlr_seat_pointer_notify_motion(instance->seat, time_msec, local_x, local_y);
     wlr_seat_pointer_notify_frame(instance->seat);
   } else if (message.event_type == pointerDownEvent || message.event_type == pointerUpEvent) {
-    wlr_seat_pointer_notify_enter(instance->seat, surface, message.local_pos_x, message.local_pos_y);
+    wlr_seat_pointer_notify_enter(instance->seat, surface, local_x, local_y);
     fwr_focus_view(view);
     if (view->scene_tree != NULL) {
       wlr_scene_node_raise_to_top(&view->scene_tree->node);
@@ -892,7 +914,7 @@ void fwr_handle_surface_pointer_event_message(
     injected_set_buttons(message.pointer, next_buttons);
     wlr_seat_pointer_notify_frame(instance->seat);
   } else if (message.event_type == pointerScrollEvent) {
-    wlr_seat_pointer_notify_enter(instance->seat, surface, message.local_pos_x, message.local_pos_y);
+    wlr_seat_pointer_notify_enter(instance->seat, surface, local_x, local_y);
 
     if (message.scroll_delta_x != 0.0) {
       wlr_seat_pointer_notify_axis(instance->seat, time_msec, WL_POINTER_AXIS_HORIZONTAL_SCROLL,

@@ -29,50 +29,6 @@
 #include "EGL/egl.h"
 
 #define GL_BGRA_EXT 0x80E1
-#define DRM_FORMAT_ARGB8888 0x34325241
-#define DRM_FORMAT_ABGR8888 0x34324241
-
-static void cpu_buffer_destroy(struct wlr_buffer *wlr_buffer) {
-  struct fwr_cpu_buffer *buf = wl_container_of(wlr_buffer, buf, base);
-  free(buf->data);
-  free(buf);
-}
-
-static bool cpu_buffer_begin_data_ptr_access(struct wlr_buffer *wlr_buffer,
-    uint32_t flags, void **data, uint32_t *format, size_t *stride) {
-  struct fwr_cpu_buffer *buf = wl_container_of(wlr_buffer, buf, base);
-  *data = buf->data;
-  *format = buf->format;
-  *stride = buf->stride;
-  return true;
-}
-
-static void cpu_buffer_end_data_ptr_access(struct wlr_buffer *wlr_buffer) {
-}
-
-static const struct wlr_buffer_impl cpu_buffer_impl = {
-  .destroy = cpu_buffer_destroy,
-  .begin_data_ptr_access = cpu_buffer_begin_data_ptr_access,
-  .end_data_ptr_access = cpu_buffer_end_data_ptr_access,
-};
-
-static struct fwr_cpu_buffer *cpu_buffer_create(int width, int height, uint32_t format) {
-  struct fwr_cpu_buffer *buf = calloc(1, sizeof(struct fwr_cpu_buffer));
-  if (buf == NULL) {
-    return NULL;
-  }
-
-  buf->stride = (size_t)width * 4;
-  buf->format = format;
-  buf->data = malloc(buf->stride * (size_t)height);
-  if (buf->data == NULL) {
-    free(buf);
-    return NULL;
-  }
-
-  wlr_buffer_init(&buf->base, &cpu_buffer_impl, width, height);
-  return buf;
-}
 
 static void texture_destruction_callback(void *user_data) {}
 
@@ -409,19 +365,10 @@ void fwr_renderer_init(struct fwr_instance *instance, gl_resolve_fn resolver) {
     if (renderer->flutter_resource_egl_context == EGL_NO_CONTEXT) {
       wlr_log(WLR_ERROR, "Could not create flutter resource EGL context! EGL error: 0x%x", eglGetError());
     }
-
-    renderer->flutter_readback_egl_context = eglCreateContext(
-      instance->egl_display, flutter_config, renderer->flutter_egl_context, flutter_context_attribs);
-    if (renderer->flutter_readback_egl_context == EGL_NO_CONTEXT) {
-      wlr_log(WLR_ERROR, "Could not create flutter readback EGL context! EGL error: 0x%x", eglGetError());
-    }
   }
 
   renderer->current_page = 0;
   renderer->current_scene.layers_count = 0;
-  renderer->flutter_scene_buffers = NULL;
-  renderer->flutter_scene_buffers_len = 0;
-  renderer->flutter_scene_buffers_cap = 0;
 
   if (pthread_mutex_init(&renderer->render_mutex, NULL) != 0) {
     wlr_log(WLR_ERROR, "Could not init render mutex");
@@ -491,6 +438,137 @@ static void flutter_transform_point(FlutterTransformation transform, double x, d
   *out_y = x * transform.skewY + y * transform.scaleY + transform.transY;
 }
 
+static int clamp_int(int v, int lo, int hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+static int ellipse_inset(double dy, int rx, int ry) {
+  if (rx <= 0 || ry <= 0) {
+    return 0;
+  }
+  double ady = fabs(dy);
+  if (ady >= (double)ry) {
+    return rx;
+  }
+  double t = 1.0 - (ady * ady) / ((double)ry * (double)ry);
+  if (t <= 0.0) {
+    return rx;
+  }
+  double x_boundary = (double)rx - (double)rx * sqrt(t);
+  int inset = (int)ceil(x_boundary);
+  if (inset < 0) inset = 0;
+  if (inset > rx) inset = rx;
+  return inset;
+}
+
+static struct wlr_box flutter_transform_rect(FlutterTransformation transform,
+    double left, double top, double right, double bottom) {
+  // Transform a rectangle defined by float edges.
+  // We floor/ceil the result to avoid "shrinking" as coordinates move fractionally.
+  double tx0, ty0, tx1, ty1, tx2, ty2, tx3, ty3;
+  flutter_transform_point(transform, left, top, &tx0, &ty0);
+  flutter_transform_point(transform, right, top, &tx1, &ty1);
+  flutter_transform_point(transform, left, bottom, &tx2, &ty2);
+  flutter_transform_point(transform, right, bottom, &tx3, &ty3);
+
+  double min_x = fmin(fmin(tx0, tx1), fmin(tx2, tx3));
+  double max_x = fmax(fmax(tx0, tx1), fmax(tx2, tx3));
+  double min_y = fmin(fmin(ty0, ty1), fmin(ty2, ty3));
+  double max_y = fmax(fmax(ty0, ty1), fmax(ty2, ty3));
+
+  double ix0 = floor(min_x);
+  double iy0 = floor(min_y);
+  double ix1 = ceil(max_x);
+  double iy1 = ceil(max_y);
+
+  return (struct wlr_box){
+    .x = (int)ix0,
+    .y = (int)iy0,
+    .width = (int)(ix1 - ix0),
+    .height = (int)(iy1 - iy0),
+  };
+}
+
+static void pixman_region32_init_rounded_rect(
+    pixman_region32_t *dst,
+    int x, int y, int width, int height,
+    int r_tl_x, int r_tl_y,
+    int r_tr_x, int r_tr_y,
+    int r_br_x, int r_br_y,
+    int r_bl_x, int r_bl_y) {
+  pixman_region32_init(dst);
+
+  if (width <= 0 || height <= 0) {
+    return;
+  }
+
+  // Clamp radii to sane values.
+  int half_w = width / 2;
+  int half_h = height / 2;
+  r_tl_x = clamp_int(r_tl_x, 0, half_w);
+  r_tr_x = clamp_int(r_tr_x, 0, half_w);
+  r_br_x = clamp_int(r_br_x, 0, half_w);
+  r_bl_x = clamp_int(r_bl_x, 0, half_w);
+  r_tl_y = clamp_int(r_tl_y, 0, half_h);
+  r_tr_y = clamp_int(r_tr_y, 0, half_h);
+  r_br_y = clamp_int(r_br_y, 0, half_h);
+  r_bl_y = clamp_int(r_bl_y, 0, half_h);
+
+  int top_band = r_tl_y > r_tr_y ? r_tl_y : r_tr_y;
+  int bottom_band = r_bl_y > r_br_y ? r_bl_y : r_br_y;
+
+  // Middle band: full width.
+  int middle_h = height - top_band - bottom_band;
+  if (middle_h > 0) {
+    pixman_region32_union_rect(dst, dst, x, y + top_band, width, middle_h);
+  }
+
+  // Top band rows.
+  for (int row = 0; row < top_band; row++) {
+    double y_center = (double)row + 0.5;
+    int inset_left = 0;
+    int inset_right = 0;
+
+    if (r_tl_y > 0 && row < r_tl_y) {
+      double dy = y_center - (double)r_tl_y;
+      inset_left = ellipse_inset(dy, r_tl_x, r_tl_y);
+    }
+    if (r_tr_y > 0 && row < r_tr_y) {
+      double dy = y_center - (double)r_tr_y;
+      inset_right = ellipse_inset(dy, r_tr_x, r_tr_y);
+    }
+
+    int w = width - inset_left - inset_right;
+    if (w > 0) {
+      pixman_region32_union_rect(dst, dst, x + inset_left, y + row, w, 1);
+    }
+  }
+
+  // Bottom band rows.
+  for (int row = height - bottom_band; row < height; row++) {
+    if (row < 0) continue;
+    double y_center = (double)row + 0.5;
+    int inset_left = 0;
+    int inset_right = 0;
+
+    if (r_bl_y > 0 && row >= height - r_bl_y) {
+      double dy = y_center - (double)(height - r_bl_y);
+      inset_left = ellipse_inset(dy, r_bl_x, r_bl_y);
+    }
+    if (r_br_y > 0 && row >= height - r_br_y) {
+      double dy = y_center - (double)(height - r_br_y);
+      inset_right = ellipse_inset(dy, r_br_x, r_br_y);
+    }
+
+    int w = width - inset_left - inset_right;
+    if (w > 0) {
+      pixman_region32_union_rect(dst, dst, x + inset_left, y + row, w, 1);
+    }
+  }
+}
+
 static struct wlr_box flutter_transform_box(FlutterTransformation transform, struct wlr_box box) {
   double x0 = box.x;
   double y0 = box.y;
@@ -508,11 +586,23 @@ static struct wlr_box flutter_transform_box(FlutterTransformation transform, str
   double min_y = fmin(fmin(ty0, ty1), fmin(ty2, ty3));
   double max_y = fmax(fmax(ty0, ty1), fmax(ty2, ty3));
 
+  // IMPORTANT:
+  // Use floor/ceil instead of truncation so the box never "shrinks" as it moves
+  // through fractional coordinates. Truncation was causing subtle jitter/desync
+  // between Flutter texture layers (subpixel) and platform-view layers (int boxes).
+  //
+  // We intentionally slightly over-approximate bounds to avoid chopping a pixel
+  // off the right/bottom edges when max_* lands between pixels.
+  double ix0 = floor(min_x);
+  double iy0 = floor(min_y);
+  double ix1 = ceil(max_x);
+  double iy1 = ceil(max_y);
+
   return (struct wlr_box){
-    .x = (int)min_x,
-    .y = (int)min_y,
-    .width = (int)(max_x - min_x),
-    .height = (int)(max_y - min_y),
+    .x = (int)ix0,
+    .y = (int)iy0,
+    .width = (int)(ix1 - ix0),
+    .height = (int)(iy1 - iy0),
   };
 }
 
@@ -553,6 +643,11 @@ struct fwr_surface_render_data {
   double output_scale;
   const pixman_region32_t *clip;
   const float *alpha;
+  // When Flutter resizes a PlatformView faster than the client can commit a new
+  // buffer, we temporarily scale the last committed client buffer to the
+  // widget size to avoid showing empty background regions.
+  double content_scale_x;
+  double content_scale_y;
 };
 
 static void render_surface_iterator(struct wlr_surface *surface, int sx, int sy, void *data) {
@@ -566,18 +661,19 @@ static void render_surface_iterator(struct wlr_surface *surface, int sx, int sy,
   struct wlr_fbox src_box;
   wlr_surface_get_buffer_source_box(surface, &src_box);
 
-  struct wlr_box dst_box = {
-    .x = sx,
-    .y = sy,
-    .width = surface_state->width,
-    .height = surface_state->height,
-  };
+  // Apply optional content scaling (used to hide resize lag).
+  // We do this in local surface space, then apply Flutter's transform.
+  double left = (double)sx * render_data->content_scale_x;
+  double top = (double)sy * render_data->content_scale_y;
+  double right = left + (double)surface_state->width * render_data->content_scale_x;
+  double bottom = top + (double)surface_state->height * render_data->content_scale_y;
 
-  dst_box = flutter_transform_box(render_data->transform, dst_box);
+  struct wlr_box dst_box = flutter_transform_rect(render_data->transform, left, top, right, bottom);
   dst_box = scale_box(dst_box, render_data->output_scale);
 
   enum wl_output_transform surface_transform = wlr_output_transform_invert(surface_state->transform);
 
+  // Regular wlroots textured quad + optional (possibly rounded) pixman clip.
   wlr_render_pass_add_texture(render_data->render_pass, &(struct wlr_render_texture_options){
     .texture = texture,
     .src_box = src_box,
@@ -601,12 +697,41 @@ static void render_scene_layer_platform(struct fwr_instance *instance, struct wl
     output_scale = instance->output->wlr_output->scale;
   }
 
+  // During fast interactive resize, Flutter can resize the PlatformView widget
+  // before the client commits a new buffer, revealing the frame background on
+  // the opposite edge. To keep things visually solid, temporarily scale the
+  // last committed client buffer up to the widget size whenever the widget is
+  // larger than the client buffer. When the client catches up, the scale
+  // returns to 1.0 automatically.
+  double content_scale_x = 1.0;
+  double content_scale_y = 1.0;
+  int surf_w = view->xdg_surface->surface->current.width;
+  int surf_h = view->xdg_surface->surface->current.height;
+  if (surf_w > 0 && surf_h > 0 && layer->size.width > 0.0 && layer->size.height > 0.0) {
+    double sx = layer->size.width / (double)surf_w;
+    double sy = layer->size.height / (double)surf_h;
+
+    // Only scale up (this is what prevents "empty strip" on expansion).
+    if (isfinite(sx) && sx > 1.001) {
+      content_scale_x = sx;
+    }
+    if (isfinite(sy) && sy > 1.001) {
+      content_scale_y = sy;
+    }
+
+    if (!isfinite(content_scale_x) || content_scale_x <= 0.0) {
+      content_scale_x = 1.0;
+    }
+    if (!isfinite(content_scale_y) || content_scale_y <= 0.0) {
+      content_scale_y = 1.0;
+    }
+  }
+
   float opacity = 1.0f;
   FlutterTransformation current_transform = {1, 0, 0, 0, 1, 0, 0, 0, 1};
   bool transform_affine = true;
   bool has_clip = false;
   pixman_region32_t clip_region;
-  struct wlr_box clip_box = {0};
 
   for (int m = 0; m < layer->platform.mutations_count; m++) {
     FlutterPlatformViewMutation *mutation = &layer->platform.mutations[m];
@@ -625,39 +750,71 @@ static void render_scene_layer_platform(struct fwr_instance *instance, struct wl
         break;
       }
       case kFlutterPlatformViewMutationTypeClipRect: {
-        struct wlr_box mutation_box = {
-          .x = mutation->clip_rect.left,
-          .y = mutation->clip_rect.top,
-          .width = mutation->clip_rect.right - mutation->clip_rect.left,
-          .height = mutation->clip_rect.bottom - mutation->clip_rect.top,
-        };
-        if (transform_affine) {
-          mutation_box = flutter_transform_box(current_transform, mutation_box);
-          if (has_clip) {
-            clip_box = intersect_boxes(clip_box, mutation_box);
-          } else {
-            clip_box = mutation_box;
-            has_clip = true;
-          }
+        // IMPORTANT: Don't truncate clip edges before transforming.
+        // Truncation causes the effective clip to "shrink" by ~1px as the window
+        // moves through fractional coordinates (visible as content getting cut off
+        // towards bottom-right).
+        struct wlr_box mutation_box = flutter_transform_rect(
+          current_transform,
+          mutation->clip_rect.left,
+          mutation->clip_rect.top,
+          mutation->clip_rect.right,
+          mutation->clip_rect.bottom
+        );
+        mutation_box = scale_box(mutation_box, output_scale);
+
+        pixman_region32_t tmp;
+        pixman_region32_init_rect(&tmp, mutation_box.x, mutation_box.y, mutation_box.width, mutation_box.height);
+        if (!has_clip) {
+          pixman_region32_init(&clip_region);
+          pixman_region32_copy(&clip_region, &tmp);
+          has_clip = true;
+        } else {
+          pixman_region32_intersect(&clip_region, &clip_region, &tmp);
         }
+        pixman_region32_fini(&tmp);
         break;
       }
       case kFlutterPlatformViewMutationTypeClipRoundedRect: {
-        struct wlr_box mutation_box = {
-          .x = mutation->clip_rounded_rect.rect.left,
-          .y = mutation->clip_rounded_rect.rect.top,
-          .width = mutation->clip_rounded_rect.rect.right - mutation->clip_rounded_rect.rect.left,
-          .height = mutation->clip_rounded_rect.rect.bottom - mutation->clip_rounded_rect.rect.top,
-        };
-        if (transform_affine) {
-          mutation_box = flutter_transform_box(current_transform, mutation_box);
-          if (has_clip) {
-            clip_box = intersect_boxes(clip_box, mutation_box);
-          } else {
-            clip_box = mutation_box;
-            has_clip = true;
-          }
+        struct wlr_box mutation_box = flutter_transform_rect(
+          current_transform,
+          mutation->clip_rounded_rect.rect.left,
+          mutation->clip_rounded_rect.rect.top,
+          mutation->clip_rounded_rect.rect.right,
+          mutation->clip_rounded_rect.rect.bottom
+        );
+        mutation_box = scale_box(mutation_box, output_scale);
+        pixman_region32_t tmp;
+
+        bool disable_radius = view->maximized || view->fullscreen;
+        if (disable_radius) {
+          pixman_region32_init_rect(&tmp, mutation_box.x, mutation_box.y, mutation_box.width, mutation_box.height);
+        } else {
+          int r_tl_x = (int)lround(mutation->clip_rounded_rect.upper_left_corner_radius.width * output_scale);
+          int r_tl_y = (int)lround(mutation->clip_rounded_rect.upper_left_corner_radius.height * output_scale);
+          int r_tr_x = (int)lround(mutation->clip_rounded_rect.upper_right_corner_radius.width * output_scale);
+          int r_tr_y = (int)lround(mutation->clip_rounded_rect.upper_right_corner_radius.height * output_scale);
+          int r_br_x = (int)lround(mutation->clip_rounded_rect.lower_right_corner_radius.width * output_scale);
+          int r_br_y = (int)lround(mutation->clip_rounded_rect.lower_right_corner_radius.height * output_scale);
+          int r_bl_x = (int)lround(mutation->clip_rounded_rect.lower_left_corner_radius.width * output_scale);
+          int r_bl_y = (int)lround(mutation->clip_rounded_rect.lower_left_corner_radius.height * output_scale);
+
+          pixman_region32_init_rounded_rect(&tmp,
+            mutation_box.x, mutation_box.y, mutation_box.width, mutation_box.height,
+            r_tl_x, r_tl_y,
+            r_tr_x, r_tr_y,
+            r_br_x, r_br_y,
+            r_bl_x, r_bl_y);
         }
+
+        if (!has_clip) {
+          pixman_region32_init(&clip_region);
+          pixman_region32_copy(&clip_region, &tmp);
+          has_clip = true;
+        } else {
+          pixman_region32_intersect(&clip_region, &clip_region, &tmp);
+        }
+        pixman_region32_fini(&tmp);
         break;
       }
       default:
@@ -667,28 +824,40 @@ static void render_scene_layer_platform(struct fwr_instance *instance, struct wl
 
   if (!transform_affine) {
     wlr_log(WLR_INFO, "Non-affine Flutter transform not supported for platform view %d", view_handle);
-  } else if (has_clip) {
-    clip_box = flutter_transform_box(current_transform, clip_box);
   }
 
-  wlr_log(WLR_DEBUG,
-    "platform view %d offset(%.2f,%.2f) size(%.2f,%.2f) output_scale %.2f transform[%.3f %.3f %.3f %.3f %.3f %.3f]",
-    view_handle,
-    (double)layer->offset.x,
-    (double)layer->offset.y,
-    (double)layer->size.width,
-    (double)layer->size.height,
-    (double)output_scale,
-    (double)current_transform.scaleX,
-    (double)current_transform.skewX,
-    (double)current_transform.transX,
-    (double)current_transform.skewY,
-    (double)current_transform.scaleY,
-    (double)current_transform.transY);
-
   if (has_clip) {
-    clip_box = scale_box(clip_box, output_scale);
-    pixman_region32_init_rect(&clip_region, clip_box.x, clip_box.y, clip_box.width, clip_box.height);
+    const pixman_box32_t *ext = pixman_region32_extents(&clip_region);
+    wlr_log(WLR_DEBUG,
+      "platform view %d offset(%.2f,%.2f) size(%.2f,%.2f) output_scale %.2f transform[%.3f %.3f %.3f %.3f %.3f %.3f] clip_extents(%d,%d,%d,%d)",
+      view_handle,
+      (double)layer->offset.x,
+      (double)layer->offset.y,
+      (double)layer->size.width,
+      (double)layer->size.height,
+      (double)output_scale,
+      (double)current_transform.scaleX,
+      (double)current_transform.skewX,
+      (double)current_transform.transX,
+      (double)current_transform.skewY,
+      (double)current_transform.scaleY,
+      (double)current_transform.transY,
+      ext->x1, ext->y1, (int)(ext->x2 - ext->x1), (int)(ext->y2 - ext->y1));
+  } else {
+    wlr_log(WLR_DEBUG,
+      "platform view %d offset(%.2f,%.2f) size(%.2f,%.2f) output_scale %.2f transform[%.3f %.3f %.3f %.3f %.3f %.3f] no_clip",
+      view_handle,
+      (double)layer->offset.x,
+      (double)layer->offset.y,
+      (double)layer->size.width,
+      (double)layer->size.height,
+      (double)output_scale,
+      (double)current_transform.scaleX,
+      (double)current_transform.skewX,
+      (double)current_transform.transX,
+      (double)current_transform.skewY,
+      (double)current_transform.scaleY,
+      (double)current_transform.transY);
   }
 
   struct fwr_surface_render_data render_data = {
@@ -697,6 +866,8 @@ static void render_scene_layer_platform(struct fwr_instance *instance, struct wl
     .output_scale = output_scale,
     .clip = has_clip ? &clip_region : NULL,
     .alpha = &opacity,
+    .content_scale_x = content_scale_x,
+    .content_scale_y = content_scale_y,
   };
 
   wlr_surface_for_each_surface(view->xdg_surface->surface, render_surface_iterator, &render_data);
@@ -730,16 +901,23 @@ static void render_scene_layer_texture(struct fwr_instance *instance, struct wlr
     output_height = 1;
   }
 
+  // Snap layer bounds to integer pixels to match platform-view rendering.
+  // This prevents subtle frame/content desync while moving windows.
+  double x0 = floor(layer->offset.x);
+  double y0 = floor(layer->offset.y);
+  double x1 = ceil(layer->offset.x + layer->size.width);
+  double y1 = ceil(layer->offset.y + layer->size.height);
+
   // Normalize coordinates to -1.0 to 1.0 (NDC)
   // Y-axis: Flutter (0 top) -> GL (-1 bottom, 1 top)
   // But our previous flip was wrong. Standard GL quad: (-1,-1) bottom-left to (1,1) top-right.
   // We want (0,0) to map to top-left (-1, 1) and (w,h) to bottom-right (1, -1).
 
-  float left = (float)((layer->offset.x / output_width) * 2.0 - 1.0);
-  float right = (float)(((layer->offset.x + layer->size.width) / output_width) * 2.0 - 1.0);
+  float left = (float)((x0 / output_width) * 2.0 - 1.0);
+  float right = (float)((x1 / output_width) * 2.0 - 1.0);
   // Invert Y for GL NDC (top is 1.0, bottom is -1.0)
-  float top = (float)(1.0 - (layer->offset.y / output_height) * 2.0);
-  float bottom = (float)(1.0 - ((layer->offset.y + layer->size.height) / output_height) * 2.0);
+  float top = (float)(1.0 - (y0 / output_height) * 2.0);
+  float bottom = (float)(1.0 - (y1 / output_height) * 2.0);
 
   const GLfloat quad_verts_local[8] = {
     right, bottom, // Bottom-right
@@ -802,102 +980,8 @@ void fwr_renderer_render_scene(struct fwr_instance *instance, struct wlr_render_
   pthread_mutex_unlock(&renderer->render_mutex);
 }
 
-static size_t count_texture_layers(const struct fwr_renderer_scene *scene) {
-  size_t count = 0;
-  for (size_t i = 0; i < scene->layers_count; i++) {
-    if (scene->layers[i].type == sceneLayerTexture && scene->layers[i].texture.texture != NULL) {
-      count++;
-    }
-  }
-  return count;
-}
-
-static bool ensure_flutter_scene_buffers(struct fwr_instance *instance, struct fwr_renderer *renderer, size_t needed) {
-  if (needed > renderer->flutter_scene_buffers_cap) {
-    size_t new_cap = renderer->flutter_scene_buffers_cap == 0 ? 4 : renderer->flutter_scene_buffers_cap;
-    while (new_cap < needed) {
-      new_cap *= 2;
-    }
-
-    struct fwr_flutter_scene_buffer *new_arr = realloc(renderer->flutter_scene_buffers, new_cap * sizeof(*new_arr));
-    if (new_arr == NULL) {
-      return false;
-    }
-
-    for (size_t i = renderer->flutter_scene_buffers_cap; i < new_cap; i++) {
-      new_arr[i].scene_buffer = NULL;
-      new_arr[i].last_cpu_buffer = NULL;
-    }
-
-    renderer->flutter_scene_buffers = new_arr;
-    renderer->flutter_scene_buffers_cap = new_cap;
-  }
-
-  for (size_t i = renderer->flutter_scene_buffers_len; i < needed; i++) {
-    renderer->flutter_scene_buffers[i].scene_buffer = wlr_scene_buffer_create(&instance->scene->tree, NULL);
-    renderer->flutter_scene_buffers[i].scene_buffer->node.data = instance;
-    renderer->flutter_scene_buffers[i].last_cpu_buffer = NULL;
-  }
-
-  renderer->flutter_scene_buffers_len = needed;
-  return true;
-}
-
-static void trim_flutter_scene_buffers(struct fwr_renderer *renderer, size_t needed) {
-  for (size_t i = needed; i < renderer->flutter_scene_buffers_len; i++) {
-    if (renderer->flutter_scene_buffers[i].scene_buffer != NULL) {
-      wlr_scene_node_destroy(&renderer->flutter_scene_buffers[i].scene_buffer->node);
-      renderer->flutter_scene_buffers[i].scene_buffer = NULL;
-    }
-    if (renderer->flutter_scene_buffers[i].last_cpu_buffer != NULL) {
-      wlr_buffer_drop(&renderer->flutter_scene_buffers[i].last_cpu_buffer->base);
-      renderer->flutter_scene_buffers[i].last_cpu_buffer = NULL;
-    }
-  }
-
-  renderer->flutter_scene_buffers_len = needed;
-}
-
-static void swizzle_rgba_to_bgra(void *data, size_t stride, int height) {
-  uint8_t *bytes = data;
-  size_t width = stride / 4;
-
-  for (int y = 0; y < height; y++) {
-    uint8_t *row = bytes + (size_t)y * stride;
-    for (size_t x = 0; x < width; x++) {
-      uint8_t *px = row + x * 4;
-      uint8_t tmp = px[0];
-      px[0] = px[2];
-      px[2] = tmp;
-    }
-  }
-}
-
-static void flip_buffer_y(void *data, size_t stride, int height) {
-  if (height <= 1) {
-    return;
-  }
-
-  uint8_t *bytes = data;
-  uint8_t *tmp = malloc(stride);
-  if (tmp == NULL) {
-    return;
-  }
-
-  for (int y = 0; y < height / 2; y++) {
-    uint8_t *top = bytes + (size_t)y * stride;
-    uint8_t *bottom = bytes + (size_t)(height - 1 - y) * stride;
-    memcpy(tmp, top, stride);
-    memcpy(top, bottom, stride);
-    memcpy(bottom, tmp, stride);
-  }
-
-  free(tmp);
-}
-
-void fwr_renderer_update_scene_buffer(struct fwr_instance *instance) {
+void fwr_renderer_update_scene_positions(struct fwr_instance *instance) {
   struct fwr_renderer *renderer = &instance->fwr_renderer;
-  struct gl_fns *fns = &renderer->fns;
 
   if (instance->scene == NULL) {
     return;
@@ -905,111 +989,7 @@ void fwr_renderer_update_scene_buffer(struct fwr_instance *instance) {
 
   pthread_mutex_lock(&renderer->render_mutex);
 
-  if (!renderer->current_scene.needs_update) {
-    pthread_mutex_unlock(&renderer->render_mutex);
-    return;
-  }
-
-  size_t texture_layers = count_texture_layers(&renderer->current_scene);
-
-  if (texture_layers < renderer->flutter_scene_buffers_len) {
-    trim_flutter_scene_buffers(renderer, texture_layers);
-  }
-
-  if (!ensure_flutter_scene_buffers(instance, renderer, texture_layers)) {
-    wlr_log(WLR_ERROR, "Failed to allocate Flutter scene buffer array");
-    renderer->current_scene.needs_update = false;
-    pthread_mutex_unlock(&renderer->render_mutex);
-    return;
-  }
-
-  EGLDisplay prev_display = eglGetCurrentDisplay();
-  EGLContext prev_context = eglGetCurrentContext();
-  EGLSurface prev_draw = eglGetCurrentSurface(EGL_DRAW);
-  EGLSurface prev_read = eglGetCurrentSurface(EGL_READ);
-
-  EGLContext readback_context = renderer->flutter_readback_egl_context != EGL_NO_CONTEXT ? renderer->flutter_readback_egl_context : renderer->flutter_egl_context;
-  if (!eglMakeCurrent(instance->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, readback_context)) {
-    wlr_log(WLR_ERROR, "Failed to make Flutter context current for readback (egl error 0x%x)", eglGetError());
-    renderer->current_scene.needs_update = false;
-    pthread_mutex_unlock(&renderer->render_mutex);
-    return;
-  }
-
-  if (renderer->current_scene.sync != 0) {
-    eglWaitSync(instance->egl_display, renderer->current_scene.sync, 0);
-    eglDestroySync(instance->egl_display, renderer->current_scene.sync);
-    renderer->current_scene.sync = 0;
-  }
-
-  if (renderer->readback_fbo == 0) {
-    fns->glGenFramebuffers(1, &renderer->readback_fbo);
-  }
-
-  const uint32_t cpu_drm_format = DRM_FORMAT_ARGB8888;
-
-  size_t texture_index = 0;
-  for (size_t i = 0; i < renderer->current_scene.layers_count; i++) {
-    struct fwr_renderer_scene_layer *layer = &renderer->current_scene.layers[i];
-    if (layer->type != sceneLayerTexture || layer->texture.texture == NULL) {
-      continue;
-    }
-
-    struct fwr_renderer_page_texture *tex = layer->texture.texture;
-    int width = (int)tex->width;
-    int height = (int)tex->height;
-    if (width <= 0 || height <= 0) {
-      texture_index++;
-      continue;
-    }
-
-    struct fwr_cpu_buffer *new_cpu_buffer = cpu_buffer_create(width, height, cpu_drm_format);
-    if (new_cpu_buffer == NULL) {
-      wlr_log(WLR_ERROR, "Failed to allocate CPU buffer for Flutter readback (%dx%d)", width, height);
-      texture_index++;
-      continue;
-    }
-
-    fns->glBindFramebuffer(GL_FRAMEBUFFER, renderer->readback_fbo);
-    fns->glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex->texture, 0);
-
-    GLenum status = fns->glCheckFramebufferStatus(GL_FRAMEBUFFER);
-    if (status != GL_FRAMEBUFFER_COMPLETE) {
-      wlr_log(WLR_ERROR, "Flutter readback FBO incomplete: 0x%x (tex=%u %dx%d)", status, tex->texture, width, height);
-      wlr_buffer_drop(&new_cpu_buffer->base);
-      texture_index++;
-      continue;
-    }
-
-    fns->glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, new_cpu_buffer->data);
-    GLenum err = fns->glGetError();
-    if (err != GL_NO_ERROR) {
-      wlr_log(WLR_ERROR, "glReadPixels failed: 0x%x", err);
-    }
-    swizzle_rgba_to_bgra(new_cpu_buffer->data, new_cpu_buffer->stride, height);
-    flip_buffer_y(new_cpu_buffer->data, new_cpu_buffer->stride, height);
-
-    struct wlr_scene_buffer *scene_buffer = renderer->flutter_scene_buffers[texture_index].scene_buffer;
-    int x = (int)lround((double)layer->offset.x);
-    int y = (int)lround((double)layer->offset.y);
-    wlr_scene_node_set_position(&scene_buffer->node, x, y);
-    wlr_scene_buffer_set_buffer(scene_buffer, &new_cpu_buffer->base);
-
-    if (renderer->flutter_scene_buffers[texture_index].last_cpu_buffer != NULL) {
-      wlr_buffer_drop(&renderer->flutter_scene_buffers[texture_index].last_cpu_buffer->base);
-    }
-    renderer->flutter_scene_buffers[texture_index].last_cpu_buffer = new_cpu_buffer;
-
-    texture_index++;
-  }
-
-  fns->glBindFramebuffer(GL_FRAMEBUFFER, 0);
-  if (prev_display != EGL_NO_DISPLAY) {
-    eglMakeCurrent(prev_display, prev_draw, prev_read, prev_context);
-  } else {
-    eglMakeCurrent(instance->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-  }
-
+  // First disable all view scene nodes
   struct fwr_view *list_view;
   wl_list_for_each(list_view, &instance->views_list, link) {
     if (list_view->scene_tree != NULL) {
@@ -1017,15 +997,9 @@ void fwr_renderer_update_scene_buffer(struct fwr_instance *instance) {
     }
   }
 
-  texture_index = 0;
+  // Update positions for platform view layers (for input hit-testing)
   for (size_t i = 0; i < renderer->current_scene.layers_count; i++) {
     struct fwr_renderer_scene_layer *layer = &renderer->current_scene.layers[i];
-
-    if (layer->type == sceneLayerTexture && layer->texture.texture != NULL) {
-      wlr_scene_node_raise_to_top(&renderer->flutter_scene_buffers[texture_index].scene_buffer->node);
-      texture_index++;
-      continue;
-    }
 
     if (layer->type != sceneLayerPlatform) {
       continue;
@@ -1040,6 +1014,7 @@ void fwr_renderer_update_scene_buffer(struct fwr_instance *instance) {
       continue;
     }
 
+    // Calculate transform from mutations
     FlutterTransformation current_transform = (FlutterTransformation){1, 0, 0, 0, 1, 0, 0, 0, 1};
     bool transform_affine = true;
 
@@ -1056,11 +1031,6 @@ void fwr_renderer_update_scene_buffer(struct fwr_instance *instance) {
       }
 
       current_transform = flutter_transform_multiply(mutation_transform, current_transform);
-    }
-
-    if (!transform_affine || current_transform.scaleX != 1.0 || current_transform.scaleY != 1.0 ||
-        current_transform.skewX != 0.0 || current_transform.skewY != 0.0) {
-      wlr_log(WLR_DEBUG, "Platform view %u has non-translation transform; ignoring scale/skew", view_handle);
     }
 
     double x = (double)layer->offset.x;
@@ -1081,7 +1051,5 @@ void fwr_renderer_update_scene_buffer(struct fwr_instance *instance) {
     wlr_scene_node_raise_to_top(&view->scene_tree->node);
   }
 
-  renderer->current_scene.needs_update = false;
   pthread_mutex_unlock(&renderer->render_mutex);
 }
-

@@ -123,18 +123,6 @@ struct fwr_renderer_scene {
   bool needs_update;
 };
 
-struct fwr_cpu_buffer {
-  struct wlr_buffer base;
-  void *data;
-  size_t stride;
-  uint32_t format;
-};
-
-struct fwr_flutter_scene_buffer {
-  struct wlr_scene_buffer *scene_buffer;
-  struct fwr_cpu_buffer *last_cpu_buffer;
-};
-
 #define FWR_RENDERER_NUM_FBOS 2
 #define FWR_RENDERER_NUM_PAGES 2
 
@@ -157,15 +145,8 @@ struct fwr_renderer {
   int flutter_tex_width;
   int flutter_tex_height;
 
-  struct fwr_flutter_scene_buffer *flutter_scene_buffers;
-  size_t flutter_scene_buffers_len;
-  size_t flutter_scene_buffers_cap;
-
-  GLuint readback_fbo;
-
   EGLContext flutter_egl_context;
   EGLContext flutter_resource_egl_context;
-  EGLContext flutter_readback_egl_context;
 
   pthread_mutex_t render_mutex;
 };
@@ -180,5 +161,4 @@ void fwr_renderer_init(struct fwr_instance *instance, gl_resolve_fn resolver);
 //void fwr_renderer_flip_fbo(struct fwr_instance *instance);
 
 void fwr_renderer_render_scene(struct fwr_instance *instance, struct wlr_render_pass *render_pass);
-
-void fwr_renderer_update_scene_buffer(struct fwr_instance *instance);
+void fwr_renderer_update_scene_positions(struct fwr_instance *instance);

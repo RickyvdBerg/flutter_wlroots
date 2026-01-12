@@ -155,3 +155,18 @@ bool decode_surface_begin_resize_message(struct dart_value *value, struct surfac
 
     return true;
 }
+
+bool decode_surface_set_position_message(struct dart_value *value, struct surface_set_position_message *out) {
+    if (value->type != dvList) {
+        return false;
+    }
+    if (value->list.length != 3) {
+        return false;
+    }
+
+    DECODE_INTEGER(out->surface_handle, &value->list.values[0]);
+    DECODE_INTEGER(out->x, &value->list.values[1]);
+    DECODE_INTEGER(out->y, &value->list.values[2]);
+
+    return true;
+}
