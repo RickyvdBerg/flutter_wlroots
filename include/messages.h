@@ -51,3 +51,16 @@ struct surface_toplevel_close_message {
 };
 
 bool decode_surface_toplevel_close_message(struct dart_value *value, struct surface_toplevel_close_message *out);
+
+struct surface_begin_move_message {
+    uint32_t surface_handle;
+};
+
+bool decode_surface_begin_move_message(struct dart_value *value, struct surface_begin_move_message *out);
+
+struct surface_begin_resize_message {
+    uint32_t surface_handle;
+    int64_t edges;
+};
+
+bool decode_surface_begin_resize_message(struct dart_value *value, struct surface_begin_resize_message *out);

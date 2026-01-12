@@ -12,6 +12,7 @@ fwr_src += files(
     'platform_channel.c',
     'plugin_registry.c',
     'text_input.c',
+    'cursor.c',
 )
 
 

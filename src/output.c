@@ -6,12 +6,12 @@
 #include <wayland-util.h>
 #include <instance.h>
 
-#define WLR_USE_UNSTABLE
 #include <wlr/util/log.h>
 #include <wlr/types/wlr_output.h>
 #include <wlr/types/wlr_output_layout.h>
 #include <wlr/render/wlr_renderer.h>
-#include <wlr/render/egl.h>
+#include <wlr/types/wlr_scene.h>
+#include <wlr/render/pass.h>
 
 #include "renderer.h"
 
@@ -19,53 +19,54 @@ static void output_frame(struct wl_listener *listener, void *data) {
   struct fwr_output *output = wl_container_of(listener, output, frame);
   struct fwr_instance *instance = output->instance;
   struct wlr_output *wlr_output = output->wlr_output;
-  //wlr_log(WLR_INFO, "output frame %d", instance->out_tex);
 
-  int64_t vsync_baton = output->instance->vsync_baton;
-  output->instance->vsync_baton = 0;
-  if (vsync_baton != 0) {
-    uint64_t current_time = output->instance->fl_proc_table.GetCurrentTime();
-    output->instance->fl_proc_table.OnVsync(
-      output->instance->engine, 
-      vsync_baton,
+  intptr_t baton = atomic_exchange(&instance->vsync_baton, 0);
+  if (baton != 0) {
+    uint64_t current_time = instance->fl_proc_table.GetCurrentTime();
+    instance->fl_proc_table.OnVsync(
+      instance->engine,
+      baton,
       current_time,
       current_time + 16600000
     );
     wlr_log(WLR_DEBUG, "Returning baton");
   }
 
-  //wlr_log(WLR_INFO, "render");
+  struct wlr_scene_output *scene_output = output->scene_output;
+  if (scene_output == NULL && instance->scene != NULL) {
+    scene_output = wlr_scene_get_scene_output(instance->scene, wlr_output);
+  }
 
-  wlr_output_attach_render(wlr_output, NULL);
+  if (scene_output == NULL) {
+    goto out;
+  }
 
-  struct wlr_renderer *renderer = instance->renderer;
-  wlr_renderer_begin(renderer, wlr_output->width, wlr_output->height);
+  fwr_renderer_update_scene_buffer(instance);
 
-  float color[4] = {0.0, 0.1, 0.0, 1.0};
-  wlr_renderer_clear(renderer, color);
+  if (!wlr_scene_output_commit(scene_output, NULL)) {
+    goto out;
+  }
 
-  //fwr_renderer_render_flutter_buffer(instance);
-  fwr_renderer_render_scene(instance);
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  wlr_scene_output_send_frame_done(scene_output, &now);
 
-	wlr_output_render_software_cursors(wlr_output, NULL);
-
-  wlr_renderer_end(renderer);
-
-  wlr_output_commit(wlr_output);
+out:
+  wlr_output_schedule_frame(wlr_output);
 }
 
-static void output_mode(struct wl_listener *listener, void *data) {
-  struct fwr_output *output = wl_container_of(listener, output, mode);
-  struct wlr_output *wlr_output = data;
+static void output_request_state(struct wl_listener *listener, void *data) {
+  struct fwr_output *output = wl_container_of(listener, output, request_state);
+  struct wlr_output_event_request_state *event = data;
 
-  wlr_log(WLR_INFO, "Set output mode");
+  wlr_output_commit_state(output->wlr_output, event->state);
 
   if (output->instance->engine != NULL) {
     FlutterWindowMetricsEvent window_metrics = {};
     window_metrics.struct_size = sizeof(FlutterWindowMetricsEvent);
-    window_metrics.width = wlr_output->width;
-    window_metrics.height = wlr_output->height;
-    window_metrics.pixel_ratio = 1.0;
+    window_metrics.width = output->wlr_output->width;
+    window_metrics.height = output->wlr_output->height;
+    window_metrics.pixel_ratio = output->wlr_output->scale;
     FlutterEngineSendWindowMetricsEvent(output->instance->engine, &window_metrics);
   }
 }
@@ -75,21 +76,12 @@ static void output_present(struct wl_listener *listener, void *data) {
   struct fwr_instance *instance = output->instance;
   struct wlr_output_event_present *event = data;
 
-  //wlr_log(WLR_INFO, "present flags: %d", event->flags);
-
   intptr_t baton = atomic_exchange(&instance->vsync_baton, 0);
   if (baton != 0) {
     uint64_t current_time = instance->fl_proc_table.GetCurrentTime();
     
     uint64_t frame_target_ns = event->refresh;
     if (frame_target_ns == 0) {
-      // TODO use wlr_output->refresh?
-      //int32_t refresh = output->wlr_output->refresh;
-      //if (refresh == 0) {
-      //  // Default to 60fps, idk what else to do.
-      //  frame_target_time = 16600000;
-      //} else {
-      //}
       frame_target_ns = 16600000;
     }
 
@@ -107,48 +99,56 @@ void fwr_server_new_output(struct wl_listener *listener, void *data) {
   struct wlr_output *wlr_output = data;
 
   if (instance->output != NULL) {
-    // Only ever have a single output.
-    // This will be the first output we get, all others are ignored.
     return;
   }
 
   wlr_output_init_render(wlr_output, instance->allocator, instance->renderer);
 
-	struct fwr_output *output =
-	  calloc(1, sizeof(struct fwr_output));
+	struct fwr_output *output = calloc(1, sizeof(struct fwr_output));
 	output->wlr_output = wlr_output;
 	output->instance = instance;
+	output->scene_output = wlr_scene_output_create(instance->scene, wlr_output);
 
-	///* Sets up a listener for the frame notify event. */
 	output->frame.notify = output_frame;
 	wl_signal_add(&wlr_output->events.frame, &output->frame);
-  output->mode.notify = output_mode;
-  wl_signal_add(&wlr_output->events.mode, &output->mode);
+  output->request_state.notify = output_request_state;
+  wl_signal_add(&wlr_output->events.request_state, &output->request_state);
   output->present.notify = output_present;
   wl_signal_add(&wlr_output->events.present, &output->present);
   
   instance->output = output;
 
-  if (!wl_list_empty(&wlr_output->modes)) {
-    struct wlr_output_mode *mode = wlr_output_preferred_mode(wlr_output);
-    wlr_output_set_mode(wlr_output, mode);
-    wlr_output_enable(wlr_output, true);
-    wlr_output_enable_adaptive_sync(wlr_output, true);
-    if (!wlr_output_commit(wlr_output)) {
-      return;
-    }
+  struct wlr_output_state state;
+  wlr_output_state_init(&state);
 
-    wlr_log(WLR_INFO, "Setting mode when creating new output!");
-
-    if (output->instance->engine != NULL) {
-      FlutterWindowMetricsEvent window_metrics = {};
-      window_metrics.struct_size = sizeof(FlutterWindowMetricsEvent);
-      window_metrics.width = mode->width;
-      window_metrics.height = mode->height;
-      window_metrics.pixel_ratio = 1.0;
-      FlutterEngineSendWindowMetricsEvent(instance->engine, &window_metrics);
-    }
+  struct wlr_output_mode *mode = wlr_output_preferred_mode(wlr_output);
+  if (mode != NULL) {
+    wlr_output_state_set_mode(&state, mode);
   }
 
-  wlr_output_layout_add_auto(instance->output_layout, wlr_output);
+  wlr_output_state_set_enabled(&state, true);
+
+  if (!wlr_output_commit_state(wlr_output, &state)) {
+    wlr_output_state_finish(&state);
+    return;
+  }
+  wlr_output_state_finish(&state);
+
+  wlr_log(WLR_INFO, "Setting mode when creating new output!");
+
+  if (output->instance->engine != NULL) {
+    FlutterWindowMetricsEvent window_metrics = {};
+    window_metrics.struct_size = sizeof(FlutterWindowMetricsEvent);
+    window_metrics.width = wlr_output->width;
+    window_metrics.height = wlr_output->height;
+    window_metrics.pixel_ratio = wlr_output->scale;
+    FlutterEngineSendWindowMetricsEvent(instance->engine, &window_metrics);
+  }
+
+  output->layout_output = wlr_output_layout_add_auto(instance->output_layout, wlr_output);
+  if (output->layout_output != NULL && output->scene_output != NULL && instance->scene_output_layout != NULL) {
+    wlr_scene_output_layout_add_output(instance->scene_output_layout, output->layout_output, output->scene_output);
+  }
+
+  wlr_output_schedule_frame(wlr_output);
 }

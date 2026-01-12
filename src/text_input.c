@@ -7,7 +7,6 @@
 #include <stdlib.h>
 #include <xkbcommon/xkbcommon.h>
 
-#define WLR_USE_UNSTABLE
 #include <wlr/util/log.h>
 
 static struct text_input_state g_text_input = {0};

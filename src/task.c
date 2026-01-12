@@ -3,7 +3,6 @@
 #include <sys/eventfd.h>
 #include <sys/syscall.h>
 
-#define WLR_USE_UNSTABLE
 #include <wlr/util/log.h>
 #include <wlr/render/egl.h>
 

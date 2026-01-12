@@ -6,6 +6,8 @@ if get_option('flutter_compositor')
   add_project_arguments('-DFLUTTER_COMPOSITOR', language : 'c')
 endif
 
+add_project_arguments('-DWLR_USE_UNSTABLE', language : 'c')
+
 embedder_dep = subproject('flutter_embedder').get_variable('embedder_dep')
 
 wlroots_dep = subproject(

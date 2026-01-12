@@ -20,7 +20,6 @@
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
 
-#define WLR_USE_UNSTABLE
 
 #include <wlr/backend.h>
 #include <wlr/util/log.h>
@@ -30,12 +29,14 @@
 #include <wlr/types/wlr_compositor.h>
 #include <wlr/types/wlr_data_device.h>
 #include <wlr/types/wlr_output_layout.h>
+#include <wlr/types/wlr_scene.h>
 #include <wlr/types/wlr_xdg_shell.h>
 #include <wlr/types/wlr_xdg_decoration_v1.h>
 #include <wlr/types/wlr_cursor.h>
 #include <wlr/types/wlr_xcursor_manager.h>
 #include <wlr/types/wlr_matrix.h>
 #include <wlr/types/wlr_presentation_time.h>
+#include <wlr/types/wlr_seat.h>
 
 #include "wlroots_hacks.h"
 
@@ -48,6 +49,7 @@
 #include "surface.h"
 #include "platform_channel.h"
 #include "text_input.h"
+#include "cursor.h"
 
 //#define eglGetProcAddr eglGetProcAddress
 //#define __glintercept_log(...) wlr_log(WLR_INFO, __VA_ARGS__)
@@ -76,16 +78,15 @@ static void handle_new_toplevel_decoration(struct wl_listener *listener, void *d
 static bool engine_cb_renderer_make_current(void *user_data) {
   struct fwr_instance *instance = user_data;
 
-  eglMakeCurrent(instance->egl->display, EGL_NO_SURFACE, EGL_NO_SURFACE, instance->fwr_renderer.flutter_egl_context);
+  eglMakeCurrent(instance->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, instance->fwr_renderer.flutter_egl_context);
 
-  //wlr_log(WLR_DEBUG, "engine_cb_renderer_make_current");
   return true;
 }
 static bool engine_cb_renderer_clear_current(void *user_data) {
   struct fwr_instance *instance = user_data;
   //wlr_egl_unset_current(instance->egl);
 
-  eglMakeCurrent(instance->egl->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+  eglMakeCurrent(instance->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
 
   //wlr_log(WLR_DEBUG, "engine_cb_renderer_clear_current");
   return true;
@@ -93,7 +94,7 @@ static bool engine_cb_renderer_clear_current(void *user_data) {
 
 static bool engine_cb_renderer_make_resource_current(void *user_data) {
   struct fwr_instance *instance = user_data;
-  eglMakeCurrent(instance->egl->display, EGL_NO_SURFACE, EGL_NO_SURFACE, instance->fwr_renderer.flutter_resource_egl_context);
+  eglMakeCurrent(instance->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, instance->fwr_renderer.flutter_resource_egl_context);
   return true;
 }
 
@@ -164,14 +165,6 @@ static void engine_cb_platform_message(
     }
     const char *method_name = name.string.string;
 
-    if (strcmp(method_name, "surface_pointer_event") == 0) {
-      fwr_handle_surface_pointer_event_message(instance, engine_message->response_handle, &args);
-      return;
-    }
-    if (strcmp(method_name, "surface_keyboard_key") == 0) {
-      fwr_handle_surface_keyboard_key_message(instance, engine_message->response_handle, &args);
-      return;
-    }
     if (strcmp(method_name, "surface_toplevel_set_size") == 0) {
       fwr_handle_surface_toplevel_set_size(instance, engine_message->response_handle, &args);
       return;
@@ -182,6 +175,34 @@ static void engine_cb_platform_message(
     }
     if (strcmp(method_name, "surface_toplevel_close") == 0) {
       fwr_handle_surface_toplevel_close(instance, engine_message->response_handle, &args);
+      return;
+    }
+    if (strcmp(method_name, "surface_focus") == 0) {
+      fwr_handle_surface_focus(instance, engine_message->response_handle, &args);
+      return;
+    }
+    if (strcmp(method_name, "surface_begin_move") == 0) {
+      fwr_handle_surface_begin_move(instance, engine_message->response_handle, &args);
+      return;
+    }
+    if (strcmp(method_name, "surface_begin_resize") == 0) {
+      fwr_handle_surface_begin_resize(instance, engine_message->response_handle, &args);
+      return;
+    }
+    if (strcmp(method_name, "surface_pointer_event") == 0) {
+      fwr_handle_surface_pointer_event_message(instance, engine_message->response_handle, &args);
+      return;
+    }
+    if (strcmp(method_name, "surface_keyboard_key") == 0) {
+      fwr_handle_surface_keyboard_key_message(instance, engine_message->response_handle, &args);
+      return;
+    }
+    if (strcmp(method_name, "surface_clear_focus") == 0) {
+      wlr_seat_pointer_clear_focus(instance->seat);
+      wlr_seat_keyboard_clear_focus(instance->seat);
+      instance->fl_proc_table.SendPlatformMessageResponse(
+          instance->engine, engine_message->response_handle,
+          method_call_null_success, sizeof(method_call_null_success));
       return;
     }
 
@@ -276,7 +297,7 @@ bool fwr_instance_create(struct fwr_instance_opts opts, struct fwr_instance **in
   instance->wl_display = wl_display_create();
   instance->wl_event_loop = wl_display_get_event_loop(instance->wl_display);
 
-	instance->backend = wlr_backend_autocreate(instance->wl_display);
+	instance->backend = wlr_backend_autocreate(instance->wl_event_loop, &instance->session);
 
   //server->renderer = wlr_renderer_autocreate(server->backend);
 
@@ -300,7 +321,6 @@ bool fwr_instance_create(struct fwr_instance_opts opts, struct fwr_instance **in
     wlr_log(WLR_ERROR, "Failed to create EGL");
     return false;
   }
-  instance->egl = egl;
 
   struct wlr_renderer *renderer = NULL;
   renderer = wlr_gles2_renderer_create(egl);
@@ -311,21 +331,28 @@ bool fwr_instance_create(struct fwr_instance_opts opts, struct fwr_instance **in
   }
   instance->renderer = renderer;
 
+  // wlr_egl is opaque in 0.18 - extract EGL display/context via accessors
+  instance->egl_display = wlr_egl_get_display(egl);
+  instance->egl_context = wlr_egl_get_context(egl);
+
   wlr_renderer_init_wl_display(instance->renderer, instance->wl_display);
 
   instance->allocator = wlr_allocator_autocreate(instance->backend, instance->renderer);
 
-  wlr_compositor_create(instance->wl_display, instance->renderer);
+  wlr_compositor_create(instance->wl_display, 6, instance->renderer);
   wlr_data_device_manager_create(instance->wl_display);
 
-  instance->output_layout = wlr_output_layout_create();
+  instance->output_layout = wlr_output_layout_create(instance->wl_display);
+  instance->scene = wlr_scene_create();
+  instance->scene_output_layout = wlr_scene_attach_output_layout(instance->scene, instance->output_layout);
+  instance->flutter_scene_buffer = NULL;
 
   instance->new_output.notify = fwr_server_new_output;
   wl_signal_add(&instance->backend->events.new_output, &instance->new_output);
 
-  instance->xdg_shell = wlr_xdg_shell_create(instance->wl_display);
-  instance->new_xdg_surface.notify = fwr_new_xdg_surface;
-  wl_signal_add(&instance->xdg_shell->events.new_surface, &instance->new_xdg_surface);
+  instance->xdg_shell = wlr_xdg_shell_create(instance->wl_display, 3);
+  instance->new_xdg_toplevel.notify = fwr_new_xdg_toplevel;
+  wl_signal_add(&instance->xdg_shell->events.new_toplevel, &instance->new_xdg_toplevel);
 
   // xdg-decoration: tell apps to use server-side decorations (we provide title bars)
   instance->decoration_manager = wlr_xdg_decoration_manager_v1_create(instance->wl_display);
@@ -350,6 +377,7 @@ bool fwr_instance_create(struct fwr_instance_opts opts, struct fwr_instance **in
 	}
 
   instance->views = handle_map_new();
+  wl_list_init(&instance->views_list);
 
   fwr_renderer_init(instance, eglGetProcAddress);
   //fwr_renderer_ensure_fbo(instance, 300, 300);
@@ -405,6 +433,7 @@ bool fwr_instance_create(struct fwr_instance_opts opts, struct fwr_instance **in
 
   fwr_plugin_registry_init(&instance->plugin_registry);
   fwr_text_input_init(instance);
+  fwr_cursor_init(instance);
 
   wlr_log(WLR_INFO, "Pre engine run");
   FlutterEngineResult fl_result = instance->fl_proc_table.Run(

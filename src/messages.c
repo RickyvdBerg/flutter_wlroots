@@ -128,3 +128,30 @@ bool decode_surface_toplevel_close_message(struct dart_value *value, struct surf
 
     return true;
 }
+
+bool decode_surface_begin_move_message(struct dart_value *value, struct surface_begin_move_message *out) {
+    if (value->type != dvList) {
+        return false;
+    }
+    if (value->list.length != 1) {
+        return false;
+    }
+
+    DECODE_INTEGER(out->surface_handle, &value->list.values[0]);
+
+    return true;
+}
+
+bool decode_surface_begin_resize_message(struct dart_value *value, struct surface_begin_resize_message *out) {
+    if (value->type != dvList) {
+        return false;
+    }
+    if (value->list.length != 2) {
+        return false;
+    }
+
+    DECODE_INTEGER(out->surface_handle, &value->list.values[0]);
+    DECODE_INTEGER(out->edges, &value->list.values[1]);
+
+    return true;
+}

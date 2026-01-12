@@ -3,7 +3,8 @@
 #include <stdlib.h>
 #include <linux/input-event-codes.h>
 
-#define WLR_USE_UNSTABLE
+#include <wayland-server-protocol.h>
+
 #include <wlr/types/wlr_cursor.h>
 #include <wlr/types/wlr_xcursor_manager.h>
 #include <wlr/types/wlr_pointer.h>
@@ -17,161 +18,331 @@
 #include <wlr/util/log.h>
 #include <wlr/types/wlr_seat.h>
 #include <wlr/types/wlr_xdg_shell.h>
+#include <wlr/types/wlr_scene.h>
 #include <xkbcommon/xkbcommon.h>
 #include <xkbcommon/xkbcommon-compose.h>
+#include <xkbcommon/xkbcommon-keysyms.h>
 #include <stdlib.h>
 #include <locale.h>
 
 #include "input.h"
 #include "shaders.h"
 #include "instance.h"
-#include "standard_message_codec.h"
-#include "constants.h"
+#include "surface.h"
 #include "handle_map.h"
 #include "messages.h"
 #include "text_input.h"
 
-#define NS_PER_MS 1000000
-
-static uint32_t uapi_mouse_button_to_flutter(uint32_t uapi_button) {
-  switch (uapi_button) {
-    case BTN_LEFT: return 1;
-    case BTN_RIGHT: return 2;
-    case BTN_MIDDLE: return 3;
-    case BTN_BACK: return 4;
-    case BTN_FORWARD: return 5;
-    case BTN_SIDE: return 6;
-    case BTN_EXTRA: return 7;
-    case BTN_0: return 8;
-    case BTN_1: return 9;
-    case BTN_2: return 10;
-    case BTN_3: return 11;
-    case BTN_4: return 12;
-    case BTN_5: return 13;
-    case BTN_6: return 14;
-    case BTN_7: return 15;
-    case BTN_8: return 16;
-    case BTN_9: return 17;
-    default: return 0;
+static int64_t flutter_button_mask_from_linux(uint32_t button) {
+  switch (button) {
+  case BTN_LEFT:
+    return kFlutterPointerButtonMousePrimary;
+  case BTN_RIGHT:
+    return kFlutterPointerButtonMouseSecondary;
+  case BTN_MIDDLE:
+    return kFlutterPointerButtonMouseMiddle;
+  case BTN_BACK:
+    return kFlutterPointerButtonMouseBack;
+  case BTN_FORWARD:
+    return kFlutterPointerButtonMouseForward;
+  default:
+    return 0;
   }
 }
 
-static uint32_t flutter_mouse_button_to_uapi(uint32_t flutter_button) {
-  switch (flutter_button) {
-    case 1: return BTN_LEFT;
-    case 2: return BTN_RIGHT;
-    case 3: return BTN_MIDDLE;
-    case 4: return BTN_BACK;
-    case 5: return BTN_FORWARD;
-    case 6: return BTN_SIDE;
-    case 7: return BTN_EXTRA;
-    case 8: return BTN_0;
-    case 9: return BTN_1;
-    case 10: return BTN_2;
-    case 11: return BTN_3;
-    case 12: return BTN_4;
-    case 13: return BTN_5;
-    case 14: return BTN_6;
-    case 15: return BTN_7;
-    case 16: return BTN_8;
-    case 17: return BTN_9;
-    default: return 0;
+static void send_flutter_mouse_event(struct fwr_instance *instance,
+    FlutterPointerPhase phase,
+    FlutterPointerSignalKind signal_kind,
+    double scroll_delta_x,
+    double scroll_delta_y) {
+  if (instance->engine == NULL) {
+    return;
   }
+
+  FlutterPointerEvent pointer_event = {};
+  pointer_event.struct_size = sizeof(FlutterPointerEvent);
+  pointer_event.phase = phase;
+  pointer_event.timestamp = instance->fl_proc_table.GetCurrentTime();
+  pointer_event.x = instance->cursor->x;
+  pointer_event.y = instance->cursor->y;
+  pointer_event.device = 0;
+  pointer_event.signal_kind = signal_kind;
+  pointer_event.scroll_delta_x = scroll_delta_x;
+  pointer_event.scroll_delta_y = scroll_delta_y;
+  pointer_event.device_kind = kFlutterPointerDeviceKindMouse;
+  pointer_event.buttons = instance->input.fl_mouse_button_mask;
+  instance->fl_proc_table.SendPointerEvent(instance->engine, &pointer_event, 1);
 }
+
+struct hit_test_result {
+  struct wlr_scene_node *node;
+  struct wlr_surface *surface;
+  struct fwr_view *view;
+  bool is_decoration;
+  bool is_flutter;
+  double nx;
+  double ny;
+};
+
+static struct hit_test_result hit_test_cursor(struct fwr_instance *instance) {
+  struct hit_test_result res = {0};
+  res.surface = NULL;
+  res.view = NULL;
+  res.is_decoration = false;
+  res.is_flutter = false;
+
+  if (instance->scene == NULL) {
+    return res;
+  }
+
+  double nx = 0.0;
+  double ny = 0.0;
+  struct wlr_scene_node *node = wlr_scene_node_at(&instance->scene->tree.node,
+      instance->cursor->x, instance->cursor->y, &nx, &ny);
+  res.node = node;
+  res.nx = nx;
+  res.ny = ny;
+
+  if (node == NULL) {
+    return res;
+  }
+
+  if (node->type == WLR_SCENE_NODE_RECT) {
+    res.is_decoration = true;
+    res.is_flutter = true;
+    res.view = node->data;
+    return res;
+  }
+
+  if (node->type != WLR_SCENE_NODE_BUFFER) {
+    return res;
+  }
+
+  struct wlr_scene_buffer *scene_buffer = wlr_scene_buffer_from_node(node);
+  struct wlr_scene_surface *scene_surface = wlr_scene_surface_try_from_buffer(scene_buffer);
+  if (scene_surface == NULL) {
+    if (node->data == instance) {
+      res.is_flutter = true;
+    }
+    return res;
+  }
+
+  res.surface = scene_surface->surface;
+
+  struct wlr_xdg_surface *xdg_surface = wlr_xdg_surface_try_from_wlr_surface(res.surface);
+  if (xdg_surface != NULL) {
+    res.view = xdg_surface->data;
+  }
+
+  return res;
+}
+
+static void send_surface_position(struct fwr_instance *instance, struct fwr_view *view);
+static void send_grab_end(struct fwr_instance *instance, struct fwr_view *view);
 
 static void process_cursor_motion(struct fwr_instance *instance, uint32_t time) {
-  wlr_xcursor_manager_set_cursor_image(instance->cursor_mgr, "left_ptr",
-                                       instance->cursor);
+  if (instance->input.grab.type == FWR_GRAB_MOVE) {
+    struct fwr_view *view;
+    if (handle_map_get(instance->views, instance->input.grab.view_handle, (void **)&view) && view != NULL) {
+      double dx = instance->cursor->x - instance->input.grab.start_cursor_x;
+      double dy = instance->cursor->y - instance->input.grab.start_cursor_y;
+      view->x = instance->input.grab.start_view_x + (int)dx;
+      view->y = instance->input.grab.start_view_y + (int)dy;
+      if (view->scene_tree != NULL) {
+        wlr_scene_node_set_position(&view->scene_tree->node, view->x, view->y);
+      }
+      send_surface_position(instance, view);
+    }
+    send_flutter_mouse_event(instance, kMove, kFlutterPointerSignalKindNone, 0.0, 0.0);
+    return;
+  }
+
+  if (instance->input.grab.type == FWR_GRAB_RESIZE) {
+    struct fwr_view *view;
+    if (handle_map_get(instance->views, instance->input.grab.view_handle, (void **)&view) && view != NULL) {
+      double dx = instance->cursor->x - instance->input.grab.start_cursor_x;
+      double dy = instance->cursor->y - instance->input.grab.start_cursor_y;
+
+      int new_x = view->x;
+      int new_y = view->y;
+      int new_width = instance->input.grab.start_view_width;
+      int new_height = instance->input.grab.start_view_height;
+
+      uint32_t edges = instance->input.grab.resize_edges;
+      if (edges & 1) {
+        new_height = instance->input.grab.start_view_height - (int)dy;
+        new_y = instance->input.grab.start_view_y + (int)dy;
+      }
+      if (edges & 2) {
+        new_height = instance->input.grab.start_view_height + (int)dy;
+      }
+      if (edges & 4) {
+        new_width = instance->input.grab.start_view_width - (int)dx;
+        new_x = instance->input.grab.start_view_x + (int)dx;
+      }
+      if (edges & 8) {
+        new_width = instance->input.grab.start_view_width + (int)dx;
+      }
+
+      if (new_width < 100) new_width = 100;
+      if (new_height < 100) new_height = 100;
+
+      view->x = new_x;
+      view->y = new_y;
+      view->width = new_width;
+      view->height = new_height;
+      if (view->scene_tree != NULL) {
+        wlr_scene_node_set_position(&view->scene_tree->node, view->x, view->y);
+      }
+      if (view->xdg_surface->role == WLR_XDG_SURFACE_ROLE_TOPLEVEL) {
+        wlr_xdg_toplevel_set_size(view->toplevel, new_width, new_height);
+      }
+      send_surface_position(instance, view);
+    }
+    send_flutter_mouse_event(instance, kMove, kFlutterPointerSignalKindNone, 0.0, 0.0);
+    return;
+  }
+
+  struct hit_test_result hit = hit_test_cursor(instance);
+
+  if (hit.is_flutter) {
+    wlr_seat_pointer_clear_focus(instance->seat);
+
+    FlutterPointerPhase phase = instance->input.fl_mouse_button_mask != 0 ? kMove : kHover;
+    send_flutter_mouse_event(instance, phase, kFlutterPointerSignalKindNone, 0.0, 0.0);
+    return;
+  }
+
+  if (hit.surface == NULL) {
+    wlr_seat_pointer_clear_focus(instance->seat);
+    return;
+  }
+
+  wlr_seat_pointer_notify_enter(instance->seat, hit.surface, hit.nx, hit.ny);
+  wlr_seat_pointer_notify_motion(instance->seat, time, hit.nx, hit.ny);
+  wlr_seat_pointer_notify_frame(instance->seat);
 }
 
 static void on_server_cursor_motion(struct wl_listener *listener, void *data) {
   struct fwr_instance *instance = wl_container_of(listener, instance, cursor_motion);
-  struct wlr_event_pointer_motion *event = data;
+  struct wlr_pointer_motion_event *event = data;
 
-  wlr_cursor_move(instance->cursor, event->device, event->delta_x,
+  wlr_cursor_move(instance->cursor, &event->pointer->base, event->delta_x,
                   event->delta_y);
   process_cursor_motion(instance, event->time_msec);
 }
 
 static void on_server_cursor_motion_absolute(struct wl_listener *listener, void *data) {
   struct fwr_instance *instance = wl_container_of(listener, instance, cursor_motion_absolute);
-  struct wlr_event_pointer_motion_absolute *event = data;
+  struct wlr_pointer_motion_absolute_event *event = data;
 
-  wlr_cursor_warp_absolute(instance->cursor, event->device, event->x, event->y);
+  wlr_cursor_warp_absolute(instance->cursor, &event->pointer->base, event->x, event->y);
   process_cursor_motion(instance, event->time_msec);
 }
 
 static void on_server_cursor_button(struct wl_listener *listener, void *data) {
   struct fwr_instance *instance = wl_container_of(listener, instance, cursor_button);
-  struct wlr_event_pointer_button *event = data;
+  struct wlr_pointer_button_event *event = data;
 
-  uint32_t fl_button = uapi_mouse_button_to_flutter(event->button);
-  if (fl_button != 0) {
-    uint32_t mask = 1 << (fl_button - 1);
-    if (event->state == WLR_BUTTON_PRESSED) {
-      instance->input.acc_mouse_button_mask |= mask;
-    } else if (event->state == WLR_BUTTON_RELEASED) {
-      instance->input.acc_mouse_button_mask &= ~mask;
+  int64_t flutter_button_mask = flutter_button_mask_from_linux(event->button);
+  if (event->state == WL_POINTER_BUTTON_STATE_PRESSED) {
+    instance->input.fl_mouse_button_mask |= flutter_button_mask;
+  } else {
+    instance->input.fl_mouse_button_mask &= ~flutter_button_mask;
+  }
+
+  if (event->state == WL_POINTER_BUTTON_STATE_RELEASED &&
+      event->button == BTN_LEFT &&
+      instance->input.grab.type != FWR_GRAB_NONE) {
+    struct fwr_view *view;
+    if (handle_map_get(instance->views, instance->input.grab.view_handle, (void **)&view) && view != NULL) {
+      send_grab_end(instance, view);
+    }
+    instance->input.grab.type = FWR_GRAB_NONE;
+    instance->input.grab.view_handle = 0;
+
+    send_flutter_mouse_event(instance, kUp, kFlutterPointerSignalKindNone, 0.0, 0.0);
+    wlr_seat_pointer_notify_button(instance->seat, event->time_msec, event->button, event->state);
+    wlr_seat_pointer_notify_frame(instance->seat);
+    return;
+  }
+
+  struct hit_test_result hit = hit_test_cursor(instance);
+
+  if (hit.is_flutter) {
+    wlr_seat_pointer_clear_focus(instance->seat);
+
+    if (hit.is_decoration && event->state == WL_POINTER_BUTTON_STATE_PRESSED && hit.view != NULL) {
+      fwr_focus_view(hit.view);
+      if (hit.view->scene_tree != NULL) {
+        wlr_scene_node_raise_to_top(&hit.view->scene_tree->node);
+      }
+    }
+
+    send_flutter_mouse_event(instance,
+      event->state == WL_POINTER_BUTTON_STATE_PRESSED ? kDown : kUp,
+      kFlutterPointerSignalKindNone,
+      0.0,
+      0.0);
+
+    wlr_seat_pointer_notify_button(instance->seat, event->time_msec, event->button, event->state);
+    wlr_seat_pointer_notify_frame(instance->seat);
+    return;
+  }
+
+  if (hit.surface != NULL && event->state == WL_POINTER_BUTTON_STATE_PRESSED) {
+    if (hit.view != NULL) {
+      fwr_focus_view(hit.view);
+      if (hit.view->scene_tree != NULL) {
+        wlr_scene_node_raise_to_top(&hit.view->scene_tree->node);
+      }
     }
   }
+
+  wlr_seat_pointer_notify_button(instance->seat, event->time_msec, event->button, event->state);
+  wlr_seat_pointer_notify_frame(instance->seat);
 }
 
 static void on_server_cursor_axis(struct wl_listener *listener, void *data) {
   struct fwr_instance *instance = wl_container_of(listener, instance, cursor_axis);
-  struct wlr_event_pointer_axis *event = data;
+  struct wlr_pointer_axis_event *event = data;
 
-  wlr_xcursor_manager_set_cursor_image(instance->cursor_mgr, "left_ptr",
-                                       instance->cursor);
+  struct hit_test_result hit = hit_test_cursor(instance);
 
-  if (event->orientation == WLR_AXIS_ORIENTATION_HORIZONTAL) {
-    instance->input.acc_scroll_delta_x += event->delta;
+  if (hit.is_flutter) {
+    wlr_seat_pointer_clear_focus(instance->seat);
+
+    double scroll_delta_x = 0.0;
+    double scroll_delta_y = 0.0;
+    if (event->orientation == WL_POINTER_AXIS_HORIZONTAL_SCROLL) {
+      scroll_delta_x = -event->delta;
+    } else {
+      scroll_delta_y = -event->delta;
+    }
+
+    send_flutter_mouse_event(instance, kHover, kFlutterPointerSignalKindScroll, scroll_delta_x, scroll_delta_y);
+
+    wlr_seat_pointer_notify_axis(instance->seat, event->time_msec, event->orientation,
+      event->delta, event->delta_discrete, event->source, event->relative_direction);
+    wlr_seat_pointer_notify_frame(instance->seat);
+    return;
   }
-  if (event->orientation == WLR_AXIS_ORIENTATION_VERTICAL) {
-    instance->input.acc_scroll_delta_y += event->delta;
-  }
+
+  wlr_seat_pointer_notify_axis(instance->seat, event->time_msec, event->orientation,
+    event->delta, event->delta_discrete, event->source, event->relative_direction);
+  wlr_seat_pointer_notify_frame(instance->seat);
 }
 
 static void on_server_cursor_frame(struct wl_listener *listener, void *data) {
   struct fwr_instance *instance = wl_container_of(listener, instance, cursor_frame);
-
-  uint32_t last_mask = instance->input.mouse_button_mask;
-  uint32_t curr_mask = instance->input.acc_mouse_button_mask;
-
-  FlutterPointerEvent pointer_event = {};
-  pointer_event.struct_size = sizeof(FlutterPointerEvent);
-  if (last_mask == 0 && curr_mask != 0) {
-    pointer_event.phase = kDown;
-  } else if (last_mask != 0 && curr_mask == 0) {
-    pointer_event.phase = kUp;
-  } else if (curr_mask == 0) {
-    pointer_event.phase = kHover;
-  } else {
-    pointer_event.phase = kMove;
-  }
-  pointer_event.x = instance->cursor->x;
-  pointer_event.y = instance->cursor->y;
-  pointer_event.device = 0;
-  pointer_event.scroll_delta_x = instance->input.acc_scroll_delta_x;
-  pointer_event.scroll_delta_y = instance->input.acc_scroll_delta_y;
-  pointer_event.signal_kind = (pointer_event.scroll_delta_x != 0 || pointer_event.scroll_delta_y != 0)
-      ? kFlutterPointerSignalKindScroll
-      : kFlutterPointerSignalKindNone;
-  pointer_event.device_kind = kFlutterPointerDeviceKindMouse;
-  pointer_event.buttons = curr_mask;
-  // TODO this is not 100% right as we should return the timestamp from libinput.
-  // On my machine these seem to be using the same source but differnt unit, is this a guarantee?
-  pointer_event.timestamp = instance->fl_proc_table.GetCurrentTime();
-  instance->fl_proc_table.SendPointerEvent(instance->engine, &pointer_event, 1);
-
-  instance->input.mouse_button_mask = curr_mask;
-  instance->input.acc_scroll_delta_x = 0.0;
-  instance->input.acc_scroll_delta_y = 0.0;
+  (void)instance;
+  (void)data;
 }
 
 static void on_server_cursor_touch_down(struct wl_listener *listener, void *data) {
   struct fwr_instance *instance = wl_container_of(listener, instance, cursor_touch_down);
-  struct wlr_event_touch_down *event = data;
-  struct fwr_input_device_state *state = event->device->data;
+  struct wlr_touch_down_event *event = data;
+  struct fwr_input_device_state *state = event->touch->base.data;
 
   if (event->touch_id >= 10) return;
   state->touch_points[event->touch_id].x = event->x;
@@ -196,8 +367,6 @@ static void on_server_cursor_touch_down(struct wl_listener *listener, void *data
   pointer_event.y = event->y * screen_height;
   pointer_event.scroll_delta_x = 0;
   pointer_event.scroll_delta_y = 0;
-  // TODO this is not 100% right as we should return the timestamp from libinput.
-  // On my machine these seem to be using the same source but differnt unit, is this a guarantee?
   pointer_event.timestamp = instance->fl_proc_table.GetCurrentTime();
   instance->fl_proc_table.SendPointerEvent(instance->engine, &pointer_event, 1);
 
@@ -207,8 +376,8 @@ static void on_server_cursor_touch_down(struct wl_listener *listener, void *data
 
 static void on_server_cursor_touch_up(struct wl_listener *listener, void *data) {
   struct fwr_instance *instance = wl_container_of(listener, instance, cursor_touch_up);
-  struct wlr_event_touch_up *event = data;
-  struct fwr_input_device_state *state = event->device->data;
+  struct wlr_touch_up_event *event = data;
+  struct fwr_input_device_state *state = event->touch->base.data;
 
   if (event->touch_id >= 10) return;
 
@@ -229,8 +398,6 @@ static void on_server_cursor_touch_up(struct wl_listener *listener, void *data) 
   pointer_event.y = state->touch_points[event->touch_id].y * screen_height;
   pointer_event.scroll_delta_x = 0;
   pointer_event.scroll_delta_y = 0;
-  // TODO this is not 100% right as we should return the timestamp from libinput.
-  // On my machine these seem to be using the same source but differnt unit, is this a guarantee?
   pointer_event.timestamp = instance->fl_proc_table.GetCurrentTime();
   instance->fl_proc_table.SendPointerEvent(instance->engine, &pointer_event, 1);
 
@@ -240,8 +407,8 @@ static void on_server_cursor_touch_up(struct wl_listener *listener, void *data) 
 
 static void on_server_cursor_touch_motion(struct wl_listener *listener, void *data) {
   struct fwr_instance *instance = wl_container_of(listener, instance, cursor_touch_motion);
-  struct wlr_event_touch_motion *event = data;
-  struct fwr_input_device_state *state = event->device->data;
+  struct wlr_touch_motion_event *event = data;
+  struct fwr_input_device_state *state = event->touch->base.data;
 
   if (event->touch_id >= 10) return;
   state->touch_points[event->touch_id].x = event->x;
@@ -264,8 +431,6 @@ static void on_server_cursor_touch_motion(struct wl_listener *listener, void *da
   pointer_event.y = event->y * screen_height;
   pointer_event.scroll_delta_x = 0;
   pointer_event.scroll_delta_y = 0;
-  // TODO this is not 100% right as we should return the timestamp from libinput.
-  // On my machine these seem to be using the same source but differnt unit, is this a guarantee?
   pointer_event.timestamp = instance->fl_proc_table.GetCurrentTime();
   instance->fl_proc_table.SendPointerEvent(instance->engine, &pointer_event, 1);
 }
@@ -274,77 +439,15 @@ static void on_server_cursor_touch_frame(struct wl_listener *listener, void *dat
   struct fwr_instance *instance = wl_container_of(listener, instance, cursor_touch_frame);
 }
 
-static uint64_t scancode_to_physical_key(uint32_t scancode) {
-  return 0x00070000 | scancode;
-}
-
-static uint64_t xkb_keysym_to_logical_key(xkb_keysym_t keysym, uint32_t unicode) {
-  if (unicode >= 0x20 && unicode <= 0x7e) {
-    return unicode | 0x00000000;
+static void on_seat_request_cursor(struct wl_listener *listener, void *data) {
+  struct fwr_instance *instance = wl_container_of(listener, instance, request_cursor);
+  struct wlr_seat_pointer_request_set_cursor_event *event = data;
+  
+  struct wlr_seat_client *focused_client = instance->seat->pointer_state.focused_client;
+  if (focused_client == event->seat_client) {
+    wlr_cursor_set_surface(instance->cursor, event->surface,
+                           event->hotspot_x, event->hotspot_y);
   }
-  if (unicode > 0 && unicode < 0x10FFFF) {
-    return unicode | 0x00000000;
-  }
-  return keysym | 0x01000000000;
-}
-
-static void send_key_to_flutter(struct fwr_keyboard *keyboard, struct wlr_event_keyboard_key *event) {
-  struct fwr_instance *instance = keyboard->instance;
-
-  struct xkb_state *kb_state = keyboard->device->keyboard->xkb_state;
-  uint16_t scan_code = (uint16_t)event->keycode + 8;
-  xkb_keysym_t key_code = xkb_state_key_get_one_sym(kb_state, scan_code);
-  uint32_t unicode = xkb_state_key_get_utf32(kb_state, scan_code);
-
-  enum xkb_compose_feed_result feed_result = xkb_compose_state_feed(keyboard->compose_state, key_code);
-  enum xkb_compose_status compose_status = xkb_compose_state_get_status(keyboard->compose_state);
-  if (feed_result == XKB_COMPOSE_FEED_ACCEPTED && compose_status == XKB_COMPOSE_COMPOSING) {
-    key_code = XKB_KEY_NoSymbol;
-  }
-
-  if (compose_status == XKB_COMPOSE_COMPOSED) {
-    key_code = xkb_compose_state_get_one_sym(keyboard->compose_state);
-    unicode = xkb_keysym_to_utf32(key_code);
-    xkb_compose_state_reset(keyboard->compose_state);
-  } else if (compose_status == XKB_COMPOSE_CANCELLED) {
-    xkb_compose_state_reset(keyboard->compose_state);
-  }
-
-  FlutterKeyEventType flType;
-  switch(event->state) {
-    case WL_KEYBOARD_KEY_STATE_PRESSED:
-      flType = kFlutterKeyEventTypeDown;
-      break;
-    case WL_KEYBOARD_KEY_STATE_RELEASED:
-    default:
-      flType = kFlutterKeyEventTypeUp;
-      break;
-  }
-
-  static char character_buf[8];
-  char *character = NULL;
-  if (flType == kFlutterKeyEventTypeDown && unicode > 0) {
-    int len = xkb_keysym_to_utf8(key_code, character_buf, sizeof(character_buf));
-    if (len > 0) {
-      character_buf[len] = '\0';
-      character = character_buf;
-    }
-  }
-
-  FlutterKeyEvent fl_event = {
-    .struct_size = sizeof(FlutterKeyEvent),
-    .timestamp = (double)instance->fl_proc_table.GetCurrentTime() / 1000.0,
-    .type = flType,
-    .physical = scancode_to_physical_key(event->keycode),
-    .logical = xkb_keysym_to_logical_key(key_code, unicode),
-    .character = character,
-    .synthesized = false,
-    .device_type = kFlutterKeyEventDeviceTypeKeyboard,
-  };
-
-  instance->fl_proc_table.SendKeyEvent(instance->engine, &fl_event, NULL, NULL);
-
-  fwr_text_input_handle_key(instance, key_code, unicode, flType == kFlutterKeyEventTypeDown);
 }
 
 static void keyboard_handle_modifiers(struct wl_listener *listener, void *data) {
@@ -359,20 +462,140 @@ static void keyboard_handle_modifiers(struct wl_listener *listener, void *data) 
 	 * same seat. You can swap out the underlying wlr_keyboard like this and
 	 * wlr_seat handles this transparently.
 	 */
-	wlr_seat_set_keyboard(keyboard->instance->seat, keyboard->device);
+	wlr_seat_set_keyboard(keyboard->instance->seat, keyboard->keyboard);
 	/* Send modifiers to the client. */
 	wlr_seat_keyboard_notify_modifiers(keyboard->instance->seat,
-		&keyboard->device->keyboard->modifiers);
+		&keyboard->keyboard->modifiers);
 
 
+}
+
+static struct fwr_view *get_focused_view(struct fwr_instance *instance) {
+  if (instance->current_focused_view == 0) {
+    return NULL;
+  }
+  struct fwr_view *view;
+  if (!handle_map_get(instance->views, instance->current_focused_view, (void **)&view)) {
+    return NULL;
+  }
+  return view;
+}
+
+static struct fwr_view *get_next_mapped_view(struct fwr_instance *instance, struct fwr_view *start, bool reverse) {
+  if (wl_list_empty(&instance->views_list)) {
+    return NULL;
+  }
+
+  struct wl_list *iter = reverse ? start->link.prev : start->link.next;
+  while (iter != &instance->views_list) {
+    struct fwr_view *candidate = wl_container_of(iter, candidate, link);
+    if (candidate->scene_tree != NULL && candidate->scene_tree->node.enabled) {
+      return candidate;
+    }
+    iter = reverse ? iter->prev : iter->next;
+  }
+
+  iter = reverse ? instance->views_list.prev : instance->views_list.next;
+  while (iter != (reverse ? start->link.prev : start->link.next)) {
+    if (iter == &instance->views_list) {
+      iter = reverse ? instance->views_list.prev : instance->views_list.next;
+      continue;
+    }
+    struct fwr_view *candidate = wl_container_of(iter, candidate, link);
+    if (candidate->scene_tree != NULL && candidate->scene_tree->node.enabled) {
+      return candidate;
+    }
+    iter = reverse ? iter->prev : iter->next;
+  }
+
+  return NULL;
+}
+
+static void focus_view_and_raise(struct fwr_view *view) {
+  fwr_focus_view(view);
+  if (view->scene_tree != NULL) {
+    wlr_scene_node_raise_to_top(&view->scene_tree->node);
+    wlr_scene_node_set_position(&view->scene_tree->node, view->x, view->y);
+  }
 }
 
 static void keyboard_handle_key(struct wl_listener *listener, void *data) {
 
 	struct fwr_keyboard *keyboard =	wl_container_of(listener, keyboard, key);
-  struct wlr_event_keyboard_key *event = data;
+  struct wlr_keyboard_key_event *event = data;
 
-  send_key_to_flutter(keyboard, event);
+  wlr_seat_set_keyboard(keyboard->instance->seat, keyboard->keyboard);
+
+  if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+    uint32_t modifiers = wlr_keyboard_get_modifiers(keyboard->keyboard);
+    xkb_keysym_t sym = xkb_state_key_get_one_sym(keyboard->keyboard->xkb_state, event->keycode + 8);
+
+    if ((modifiers & WLR_MODIFIER_ALT) && sym == XKB_KEY_Tab) {
+      struct fwr_instance *instance = keyboard->instance;
+      struct fwr_view *focused = get_focused_view(instance);
+      if (focused == NULL) {
+        struct fwr_view *first = wl_container_of(instance->views_list.next, first, link);
+        if (first->scene_tree != NULL && first->scene_tree->node.enabled) {
+          focus_view_and_raise(first);
+        }
+      } else {
+        struct fwr_view *next = get_next_mapped_view(instance, focused, (modifiers & WLR_MODIFIER_SHIFT) != 0);
+        if (next != NULL) {
+          focus_view_and_raise(next);
+        }
+      }
+      return;
+    }
+
+    if (modifiers & WLR_MODIFIER_LOGO) {
+      struct fwr_instance *instance = keyboard->instance;
+      struct fwr_view *view = get_focused_view(instance);
+      if (view == NULL || instance->output == NULL) {
+        return;
+      }
+
+      int output_width = instance->output->wlr_output->width;
+      int output_height = instance->output->wlr_output->height;
+
+      if (sym == XKB_KEY_Left || sym == XKB_KEY_Right) {
+        view->maximized = false;
+        if (view->xdg_surface->role == WLR_XDG_SURFACE_ROLE_TOPLEVEL) {
+          wlr_xdg_toplevel_set_maximized(view->toplevel, false);
+        }
+
+        int half_width = output_width / 2;
+        view->x = (sym == XKB_KEY_Left) ? 0 : half_width;
+        view->y = 0;
+        view->width = half_width;
+        view->height = output_height;
+
+        if (view->scene_tree != NULL) {
+          wlr_scene_node_set_position(&view->scene_tree->node, view->x, view->y);
+        }
+        if (view->xdg_surface->role == WLR_XDG_SURFACE_ROLE_TOPLEVEL) {
+          wlr_xdg_toplevel_set_size(view->toplevel, view->width, view->height);
+        }
+        send_surface_position(instance, view);
+        return;
+      }
+
+      if (sym == XKB_KEY_Up) {
+        view->maximized = true;
+        if (view->xdg_surface->role == WLR_XDG_SURFACE_ROLE_TOPLEVEL) {
+          wlr_xdg_toplevel_set_maximized(view->toplevel, true);
+        }
+        view->x = 0;
+        view->y = 0;
+        if (view->scene_tree != NULL) {
+          wlr_scene_node_set_position(&view->scene_tree->node, view->x, view->y);
+        }
+        send_surface_position(instance, view);
+        return;
+      }
+    }
+  }
+
+  wlr_seat_keyboard_notify_key(keyboard->instance->seat, event->time_msec, event->keycode, event->state);
 
 }
 
@@ -390,9 +613,11 @@ static void keyboard_destroy(struct wl_listener *listener, void *data) {
 static void server_new_keyboard(struct fwr_instance *instance,
 		struct wlr_input_device *device) {
 
+  struct wlr_keyboard *wlr_keyboard = wlr_keyboard_from_input_device(device);
+
   struct fwr_keyboard *keyboard = calloc(1, sizeof(struct fwr_keyboard));
   keyboard->instance = instance;
-  keyboard->device = device;
+  keyboard->keyboard = wlr_keyboard;
 
   // Prepare XKB keymap and asing to keyboard, default layout is "us"
   struct xkb_context *context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
@@ -414,23 +639,21 @@ static void server_new_keyboard(struct fwr_instance *instance,
   keyboard->compose_state = xkb_compose_state_new(xkb_compose_table_new_from_locale(context, setlocale(LC_CTYPE, NULL), XKB_COMPOSE_COMPILE_NO_FLAGS), XKB_COMPOSE_STATE_NO_FLAGS);
   if (keyboard->compose_state == NULL) {
     wlr_log(WLR_ERROR, "Could not create new XKB compose state.\n");
-    //goto fail_free_plain_xkb_state;
   }
 
-  wlr_keyboard_set_keymap(device->keyboard, keymap);
+  wlr_keyboard_set_keymap(wlr_keyboard, keymap);
   xkb_keymap_unref(keymap);
   xkb_context_unref(context);
-  wlr_keyboard_set_repeat_info(device->keyboard, 25, 600);
+  wlr_keyboard_set_repeat_info(wlr_keyboard, 25, 600);
 
-  // here we set up listeners for keyboard events
   keyboard->modifiers.notify = keyboard_handle_modifiers;
-  wl_signal_add(&device->keyboard->events.modifiers, &keyboard->modifiers);
+  wl_signal_add(&wlr_keyboard->events.modifiers, &keyboard->modifiers);
   keyboard->key.notify = keyboard_handle_key;
-  wl_signal_add(&device->keyboard->events.key, &keyboard->key);
+  wl_signal_add(&wlr_keyboard->events.key, &keyboard->key);
   keyboard->destroy.notify = keyboard_destroy;
-  wl_signal_add(&device->keyboard->events.destroy, &keyboard->destroy);
+  wl_signal_add(&wlr_keyboard->base.events.destroy, &keyboard->destroy);
 
-  wlr_seat_set_keyboard(instance->seat, device);
+  wlr_seat_set_keyboard(instance->seat, wlr_keyboard);
 
   // add keyboard to list of keyboards
   wl_list_insert(&instance->keyboards, &keyboard->link);
@@ -490,9 +713,14 @@ void fwr_input_init(struct fwr_instance *instance) {
 	wlr_cursor_attach_output_layout(instance->cursor, instance->output_layout);
 
   instance->cursor_mgr = wlr_xcursor_manager_create(NULL, 24);
-	wlr_xcursor_manager_load(instance->cursor_mgr, 1);
+ 	wlr_xcursor_manager_load(instance->cursor_mgr, 1);
+  wlr_cursor_set_xcursor(instance->cursor, instance->cursor_mgr, "left_ptr");
+
 
 	instance->seat = wlr_seat_create(instance->wl_display, "seat0");
+
+  instance->request_cursor.notify = on_seat_request_cursor;
+  wl_signal_add(&instance->seat->events.request_set_cursor, &instance->request_cursor);
 
   instance->cursor_motion.notify = on_server_cursor_motion;
   wl_signal_add(&instance->cursor->events.motion, &instance->cursor_motion);
@@ -519,207 +747,361 @@ void fwr_input_init(struct fwr_instance *instance) {
 	wl_signal_add(&instance->backend->events.new_input, &instance->new_input);
 }
 
-void fwr_handle_surface_keyboard_key_message(struct fwr_instance *instance, const FlutterPlatformMessageResponseHandle *handle, struct dart_value *args) {
-  struct surface_keyboard_key_message message;
-  if (!decode_surface_keyboard_key_message(args, &message)) {
-    goto error;
+static const uint8_t pointerDownEvent = 1;
+static const uint8_t pointerUpEvent = 2;
+static const uint8_t pointerHoverEvent = 3;
+static const uint8_t pointerMoveEvent = 4;
+static const uint8_t pointerEnterEvent = 5;
+static const uint8_t pointerExitEvent = 6;
+static const uint8_t pointerScrollEvent = 7;
+
+static bool flutter_mouse_button_to_linux(int64_t flutter_button, uint32_t *linux_button_out) {
+  switch (flutter_button) {
+  case kFlutterPointerButtonMousePrimary:
+    *linux_button_out = BTN_LEFT;
+    return true;
+  case kFlutterPointerButtonMouseSecondary:
+    *linux_button_out = BTN_RIGHT;
+    return true;
+  case kFlutterPointerButtonMouseMiddle:
+    *linux_button_out = BTN_MIDDLE;
+    return true;
+  case kFlutterPointerButtonMouseBack:
+    *linux_button_out = BTN_BACK;
+    return true;
+  case kFlutterPointerButtonMouseForward:
+    *linux_button_out = BTN_FORWARD;
+    return true;
+  default:
+    return false;
   }
-
-  struct fwr_view *view;
-  if (!handle_map_get(instance->views, message.surface_handle, (void**) &view)) {
-    // This implies a race condition of surface removal.
-    // We return success here.
-    goto success;
-  }
-
-  uint32_t type;
-
-  switch(message.event_type) {
-    case 0:
-      type = WL_KEYBOARD_KEY_STATE_RELEASED;
-      break;
-    case 1:
-      type = WL_KEYBOARD_KEY_STATE_PRESSED;
-      break;
-    default:
-      goto error;
-  }
-
-  wlr_seat_keyboard_notify_key(instance->seat, message.timestamp / NS_PER_MS, message.keycode - 8, type);
-
-success:
-  instance->fl_proc_table.SendPlatformMessageResponse(instance->engine, handle, method_call_null_success, sizeof(method_call_null_success));
-  return;
-
-error:
-  wlr_log(WLR_ERROR, "Invalid surface keyboard event message");
-  // Send failure
-  instance->fl_proc_table.SendPlatformMessageResponse(instance->engine, handle, NULL, 0);
 }
 
-void fwr_handle_surface_pointer_event_message(struct fwr_instance *instance, const FlutterPlatformMessageResponseHandle *handle, struct dart_value *args) {
+struct injected_pointer_state {
+  int64_t pointer;
+  int64_t buttons;
+  bool active;
+};
+
+static struct injected_pointer_state injected_pointer_states[16] = {0};
+
+static int64_t injected_get_buttons(int64_t pointer) {
+  for (size_t i = 0; i < sizeof(injected_pointer_states) / sizeof(injected_pointer_states[0]); i++) {
+    if (injected_pointer_states[i].active && injected_pointer_states[i].pointer == pointer) {
+      return injected_pointer_states[i].buttons;
+    }
+  }
+  return 0;
+}
+
+static void injected_set_buttons(int64_t pointer, int64_t buttons) {
+  for (size_t i = 0; i < sizeof(injected_pointer_states) / sizeof(injected_pointer_states[0]); i++) {
+    if (injected_pointer_states[i].active && injected_pointer_states[i].pointer == pointer) {
+      injected_pointer_states[i].buttons = buttons;
+      return;
+    }
+  }
+
+  for (size_t i = 0; i < sizeof(injected_pointer_states) / sizeof(injected_pointer_states[0]); i++) {
+    if (!injected_pointer_states[i].active) {
+      injected_pointer_states[i].active = true;
+      injected_pointer_states[i].pointer = pointer;
+      injected_pointer_states[i].buttons = buttons;
+      return;
+    }
+  }
+}
+
+static void injected_clear_pointer(int64_t pointer) {
+  for (size_t i = 0; i < sizeof(injected_pointer_states) / sizeof(injected_pointer_states[0]); i++) {
+    if (injected_pointer_states[i].active && injected_pointer_states[i].pointer == pointer) {
+      injected_pointer_states[i].active = false;
+      injected_pointer_states[i].pointer = 0;
+      injected_pointer_states[i].buttons = 0;
+      return;
+    }
+  }
+}
+
+void fwr_handle_surface_pointer_event_message(
+    struct fwr_instance *instance,
+    const FlutterPlatformMessageResponseHandle *handle,
+    struct dart_value *args) {
   struct surface_pointer_event_message message;
   if (!decode_surface_pointer_event_message(args, &message)) {
     goto error;
   }
 
   struct fwr_view *view;
-  if (!handle_map_get(instance->views, message.surface_handle, (void**) &view)) {
-    // This implies a race condition of surface removal.
-    // We return success here.
+  if (!handle_map_get(instance->views, message.surface_handle, (void **)&view) || view == NULL) {
     goto success;
   }
 
-  //wlr_log(WLR_INFO, "yay pointer event %d %ld", message.event_type, message.buttons);
-
-  struct fwr_input_state *input_state = &instance->input;
-
-  struct wlr_surface_state *surface_state = &view->surface->surface->current;
-
-  double transformed_local_pos_x = message.local_pos_x / message.widget_size_x * surface_state->width;
-  double transformed_local_pos_y = message.local_pos_y / message.widget_size_y * surface_state->height;
-
-  switch (message.device_kind) {
-    case pointerKindMouse: {
-      wlr_seat_pointer_notify_enter(instance->seat, view->surface->surface, transformed_local_pos_x, transformed_local_pos_y);
-      wlr_seat_pointer_notify_motion(instance->seat, message.timestamp / NS_PER_MS, transformed_local_pos_x, transformed_local_pos_y);
-
-      for (int n = 0; n < 32; n++) {
-        bool last = ((instance->input.fl_mouse_button_mask >> n) & 0b1) != 0;
-        bool curr = ((message.buttons >> n) & 0b1) != 0;
-
-        uint32_t uapi_button = flutter_mouse_button_to_uapi(n + 1);
-
-        if (!last & curr) {
-          wlr_seat_pointer_notify_button(instance->seat,
-                                        message.timestamp / NS_PER_MS, uapi_button,
-                                        WLR_BUTTON_PRESSED);
-        } else if (last & !curr) {
-          wlr_seat_pointer_notify_button(instance->seat,
-                                        message.timestamp / NS_PER_MS, uapi_button,
-                                        WLR_BUTTON_RELEASED);
-        }
-      }
-      instance->input.fl_mouse_button_mask = message.buttons;
-
-      if (message.scroll_delta_x != 0) {
-        // TODO: Pass this through from the original event instead.
-        // Dependent on getting https://github.com/flutter/flutter/issues/100680 merged.
-        int32_t discrete_scroll_amount = message.scroll_delta_x >= 0 ? 1 : -1;
-
-        wlr_seat_pointer_notify_axis(
-            instance->seat, message.timestamp / NS_PER_MS,
-            WLR_AXIS_ORIENTATION_HORIZONTAL, message.scroll_delta_x,
-            discrete_scroll_amount, WLR_AXIS_SOURCE_WHEEL);
-      }
-
-      if (message.scroll_delta_y != 0) {
-        // TODO: Pass this through from the original event instead.
-        // Dependent on getting https://github.com/flutter/flutter/issues/100680 merged.
-        int32_t discrete_scroll_amount = message.scroll_delta_y >= 0 ? 1 : -1;
-
-        wlr_seat_pointer_notify_axis(
-            instance->seat, message.timestamp / NS_PER_MS,
-            WLR_AXIS_ORIENTATION_VERTICAL, message.scroll_delta_y,
-            discrete_scroll_amount, WLR_AXIS_SOURCE_WHEEL);
-      }
-
-      if(message.event_type == pointerExitEvent) {
-        wlr_seat_pointer_clear_focus(instance->seat);
-      }
-
-      wlr_seat_pointer_notify_frame(instance->seat);
-
-      break;
-    }
-
-    case pointerKindTouch: {
-      int first_free_touch_id = -1;
-      int touch_id = -1;
-      for (int i = 0; i < FWR_MULTITOUCH_MAX; i++) {
-        if (input_state->touch_ids[i] == -1 && first_free_touch_id == -1) {
-          first_free_touch_id = i;
-        }
-        if (input_state->touch_ids[i] == message.pointer) {
-          touch_id = i;
-          break;
-        }
-      }
-
-      if (message.event_type == pointerDownEvent) {
-        if (touch_id != -1) {
-          wlr_log(WLR_ERROR, "Got already allocated touch in on pointerDownEvent!! (%d %ld)", touch_id, message.pointer);
-          goto success;
-        }
-
-        if (first_free_touch_id == -1) {
-          wlr_log(WLR_ERROR, "Got pointerDownEvent but all touch ids where already allocated!");
-          goto success;
-        }
-
-        input_state->touch_ids[first_free_touch_id] = message.pointer;
-      } else {
-        if (touch_id == -1) {
-          goto success;
-        }
-      }
-
-      bool accepts_touch = wlr_surface_accepts_touch(instance->seat, view->surface->surface);
-      double transformed_local_pos_x = message.local_pos_x / message.widget_size_x * surface_state->width;
-      double transformed_local_pos_y = message.local_pos_y / message.widget_size_y * surface_state->height;
-
-      if (message.event_type == pointerDownEvent) {
-        wlr_log(WLR_INFO, "touch down %d", touch_id);
-        if (accepts_touch) {
-          wlr_seat_touch_notify_down(instance->seat, view->surface->surface, message.timestamp / NS_PER_MS, touch_id, transformed_local_pos_x, transformed_local_pos_y);
-          wlr_seat_touch_notify_frame(instance->seat);
-        } else if(!input_state->simulating_pointer_from_touch) {
-          input_state->simulating_pointer_from_touch = true;
-          input_state->touch_pointer_simulation_id = first_free_touch_id;
-
-          wlr_seat_pointer_notify_enter(instance->seat, view->surface->surface, transformed_local_pos_x, transformed_local_pos_y);
-          wlr_seat_pointer_notify_motion(instance->seat, message.timestamp / NS_PER_MS, transformed_local_pos_x, transformed_local_pos_y);
-          wlr_seat_pointer_notify_button(instance->seat, message.timestamp / NS_PER_MS, BTN_LEFT, WLR_BUTTON_PRESSED);
-          wlr_seat_pointer_notify_frame(instance->seat);
-        }
-        // TODO focus?
-      } 
-      if (message.event_type == pointerUpEvent) {
-        wlr_log(WLR_INFO, "touch up %d", touch_id);
-        input_state->touch_ids[touch_id] = -1;
-        if (accepts_touch) {
-          wlr_seat_touch_notify_up(instance->seat, message.timestamp / NS_PER_MS, touch_id);
-          wlr_seat_touch_notify_frame(instance->seat);
-        } else if (input_state->touch_pointer_simulation_id == touch_id) {
-          input_state->simulating_pointer_from_touch = false;
-          input_state->touch_pointer_simulation_id = -1;
-
-          wlr_seat_pointer_notify_button(instance->seat, message.timestamp / NS_PER_MS, BTN_LEFT, WLR_BUTTON_RELEASED);
-          wlr_seat_pointer_clear_focus(instance->seat);
-          wlr_seat_pointer_notify_frame(instance->seat);
-        }
-      }
-      if (message.event_type == pointerMoveEvent) {
-        wlr_log(WLR_INFO, "touch move %d", touch_id);
-        if (accepts_touch) {
-          wlr_seat_touch_notify_motion(instance->seat, message.timestamp / NS_PER_MS, touch_id, transformed_local_pos_x, transformed_local_pos_y);
-          wlr_seat_touch_notify_frame(instance->seat);
-        } else if (input_state->touch_pointer_simulation_id == touch_id) {
-          wlr_seat_pointer_notify_motion(instance->seat, message.timestamp / NS_PER_MS, transformed_local_pos_x, transformed_local_pos_y);
-          wlr_seat_pointer_notify_frame(instance->seat);
-        }
-      }
-      break;
-    }
+  struct wlr_surface *surface = view->xdg_surface->surface;
+  if (surface == NULL) {
+    goto success;
   }
 
+  uint32_t time_msec = (uint32_t)(message.timestamp / 1000);
+
+  if (message.event_type == pointerEnterEvent) {
+    wlr_seat_pointer_notify_enter(instance->seat, surface, message.local_pos_x, message.local_pos_y);
+    wlr_seat_pointer_notify_frame(instance->seat);
+  } else if (message.event_type == pointerExitEvent) {
+    wlr_seat_pointer_clear_focus(instance->seat);
+    injected_clear_pointer(message.pointer);
+  } else if (message.event_type == pointerHoverEvent || message.event_type == pointerMoveEvent) {
+    wlr_seat_pointer_notify_enter(instance->seat, surface, message.local_pos_x, message.local_pos_y);
+    wlr_seat_pointer_notify_motion(instance->seat, time_msec, message.local_pos_x, message.local_pos_y);
+    wlr_seat_pointer_notify_frame(instance->seat);
+  } else if (message.event_type == pointerDownEvent || message.event_type == pointerUpEvent) {
+    wlr_seat_pointer_notify_enter(instance->seat, surface, message.local_pos_x, message.local_pos_y);
+    fwr_focus_view(view);
+    if (view->scene_tree != NULL) {
+      wlr_scene_node_raise_to_top(&view->scene_tree->node);
+    }
+
+    int64_t prev_buttons = injected_get_buttons(message.pointer);
+    int64_t next_buttons = message.buttons;
+    int64_t changed = prev_buttons ^ next_buttons;
+
+    const int64_t flutter_buttons[] = {
+        kFlutterPointerButtonMousePrimary,
+        kFlutterPointerButtonMouseSecondary,
+        kFlutterPointerButtonMouseMiddle,
+        kFlutterPointerButtonMouseBack,
+        kFlutterPointerButtonMouseForward,
+    };
+
+    for (size_t i = 0; i < sizeof(flutter_buttons) / sizeof(flutter_buttons[0]); i++) {
+      int64_t flutter_button = flutter_buttons[i];
+      if ((changed & flutter_button) == 0) {
+        continue;
+      }
+
+      uint32_t linux_button;
+      if (!flutter_mouse_button_to_linux(flutter_button, &linux_button)) {
+        continue;
+      }
+
+      enum wl_pointer_button_state state =
+          (next_buttons & flutter_button) ? WL_POINTER_BUTTON_STATE_PRESSED : WL_POINTER_BUTTON_STATE_RELEASED;
+      wlr_seat_pointer_notify_button(instance->seat, time_msec, linux_button, state);
+    }
+
+    injected_set_buttons(message.pointer, next_buttons);
+    wlr_seat_pointer_notify_frame(instance->seat);
+  } else if (message.event_type == pointerScrollEvent) {
+    wlr_seat_pointer_notify_enter(instance->seat, surface, message.local_pos_x, message.local_pos_y);
+
+    if (message.scroll_delta_x != 0.0) {
+      wlr_seat_pointer_notify_axis(instance->seat, time_msec, WL_POINTER_AXIS_HORIZONTAL_SCROLL,
+          -message.scroll_delta_x, 0, WL_POINTER_AXIS_SOURCE_WHEEL, 0);
+    }
+    if (message.scroll_delta_y != 0.0) {
+      wlr_seat_pointer_notify_axis(instance->seat, time_msec, WL_POINTER_AXIS_VERTICAL_SCROLL,
+          -message.scroll_delta_y, 0, WL_POINTER_AXIS_SOURCE_WHEEL, 0);
+    }
+
+    wlr_seat_pointer_notify_frame(instance->seat);
+  }
 
 success:
-  instance->fl_proc_table.SendPlatformMessageResponse(instance->engine, handle, method_call_null_success, sizeof(method_call_null_success));
+  instance->fl_proc_table.SendPlatformMessageResponse(
+      instance->engine, handle, method_call_null_success,
+      sizeof(method_call_null_success));
   return;
 
 error:
   wlr_log(WLR_ERROR, "Invalid surface pointer event message");
-  // Send failure
   instance->fl_proc_table.SendPlatformMessageResponse(instance->engine, handle, NULL, 0);
 }
+
+void fwr_handle_surface_keyboard_key_message(
+    struct fwr_instance *instance,
+    const FlutterPlatformMessageResponseHandle *handle,
+    struct dart_value *args) {
+  struct surface_keyboard_key_message message;
+  if (!decode_surface_keyboard_key_message(args, &message)) {
+    goto error;
+  }
+
+  struct fwr_view *view;
+  if (!handle_map_get(instance->views, message.surface_handle, (void **)&view) || view == NULL) {
+    goto success;
+  }
+
+  fwr_focus_view(view);
+
+  struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(instance->seat);
+  if (keyboard != NULL) {
+    wlr_seat_set_keyboard(instance->seat, keyboard);
+  }
+
+  enum wl_keyboard_key_state state =
+      message.event_type != 0 ? WL_KEYBOARD_KEY_STATE_PRESSED : WL_KEYBOARD_KEY_STATE_RELEASED;
+  wlr_seat_keyboard_notify_key(instance->seat, (uint32_t)(message.timestamp / 1000),
+      (uint32_t)message.keycode, state);
+
+success:
+  instance->fl_proc_table.SendPlatformMessageResponse(
+      instance->engine, handle, method_call_null_success,
+      sizeof(method_call_null_success));
+  return;
+
+error:
+  wlr_log(WLR_ERROR, "Invalid surface keyboard key message");
+  instance->fl_proc_table.SendPlatformMessageResponse(instance->engine, handle, NULL, 0);
+}
+
+static void send_surface_position(struct fwr_instance *instance, struct fwr_view *view) {
+  struct message_builder msg = message_builder_new();
+  struct message_builder_segment msg_seg = message_builder_segment(&msg);
+  message_builder_segment_push_string(&msg_seg, "surface_position");
+  message_builder_segment_finish(&msg_seg);
+
+  msg_seg = message_builder_segment(&msg);
+  struct message_builder_segment arg_seg =
+      message_builder_segment_push_map(&msg_seg, 5);
+  message_builder_segment_push_string(&arg_seg, "handle");
+  message_builder_segment_push_int64(&arg_seg, view->handle);
+  message_builder_segment_push_string(&arg_seg, "x");
+  message_builder_segment_push_int64(&arg_seg, view->x);
+  message_builder_segment_push_string(&arg_seg, "y");
+  message_builder_segment_push_int64(&arg_seg, view->y);
+  message_builder_segment_push_string(&arg_seg, "width");
+  message_builder_segment_push_int64(&arg_seg, view->width);
+  message_builder_segment_push_string(&arg_seg, "height");
+  message_builder_segment_push_int64(&arg_seg, view->height);
+  message_builder_segment_finish(&arg_seg);
+
+  message_builder_segment_finish(&msg_seg);
+  uint8_t *msg_buf;
+  size_t msg_buf_len;
+  message_builder_finish(&msg, &msg_buf, &msg_buf_len);
+
+  FlutterPlatformMessage platform_message = {};
+  platform_message.struct_size = sizeof(FlutterPlatformMessage);
+  platform_message.channel = "wlroots";
+  platform_message.message = msg_buf;
+  platform_message.message_size = msg_buf_len;
+  platform_message.response_handle = NULL;
+  instance->fl_proc_table.SendPlatformMessage(instance->engine, &platform_message);
+
+  free(msg_buf);
+}
+
+static void send_grab_end(struct fwr_instance *instance, struct fwr_view *view) {
+  struct message_builder msg = message_builder_new();
+  struct message_builder_segment msg_seg = message_builder_segment(&msg);
+  message_builder_segment_push_string(&msg_seg, "surface_grab_end");
+  message_builder_segment_finish(&msg_seg);
+
+  msg_seg = message_builder_segment(&msg);
+  struct message_builder_segment arg_seg =
+      message_builder_segment_push_map(&msg_seg, 5);
+  message_builder_segment_push_string(&arg_seg, "handle");
+  message_builder_segment_push_int64(&arg_seg, view->handle);
+  message_builder_segment_push_string(&arg_seg, "x");
+  message_builder_segment_push_int64(&arg_seg, view->x);
+  message_builder_segment_push_string(&arg_seg, "y");
+  message_builder_segment_push_int64(&arg_seg, view->y);
+  message_builder_segment_push_string(&arg_seg, "cursor_x");
+  message_builder_segment_push_float64(&arg_seg, instance->cursor->x);
+  message_builder_segment_push_string(&arg_seg, "cursor_y");
+  message_builder_segment_push_float64(&arg_seg, instance->cursor->y);
+  message_builder_segment_finish(&arg_seg);
+
+  message_builder_segment_finish(&msg_seg);
+  uint8_t *msg_buf;
+  size_t msg_buf_len;
+  message_builder_finish(&msg, &msg_buf, &msg_buf_len);
+
+  FlutterPlatformMessage platform_message = {};
+  platform_message.struct_size = sizeof(FlutterPlatformMessage);
+  platform_message.channel = "wlroots";
+  platform_message.message = msg_buf;
+  platform_message.message_size = msg_buf_len;
+  platform_message.response_handle = NULL;
+  instance->fl_proc_table.SendPlatformMessage(instance->engine, &platform_message);
+
+  free(msg_buf);
+}
+
+void fwr_handle_surface_begin_move(
+    struct fwr_instance *instance,
+    const FlutterPlatformMessageResponseHandle *handle,
+    struct dart_value *args) {
+  struct surface_begin_move_message message;
+  if (!decode_surface_begin_move_message(args, &message)) {
+    goto error;
+  }
+
+  struct fwr_view *view;
+  if (!handle_map_get(instance->views, message.surface_handle, (void **)&view) || view == NULL) {
+    goto success;
+  }
+
+  instance->input.grab.type = FWR_GRAB_MOVE;
+  instance->input.grab.view_handle = view->handle;
+  instance->input.grab.start_cursor_x = instance->cursor->x;
+  instance->input.grab.start_cursor_y = instance->cursor->y;
+  instance->input.grab.start_view_x = view->x;
+  instance->input.grab.start_view_y = view->y;
+
+  fwr_focus_view(view);
+  if (view->scene_tree != NULL) {
+    wlr_scene_node_raise_to_top(&view->scene_tree->node);
+  }
+
+success:
+  instance->fl_proc_table.SendPlatformMessageResponse(
+      instance->engine, handle, method_call_null_success,
+      sizeof(method_call_null_success));
+  return;
+
+error:
+  wlr_log(WLR_ERROR, "Invalid surface begin move message");
+  instance->fl_proc_table.SendPlatformMessageResponse(instance->engine, handle, NULL, 0);
+}
+
+void fwr_handle_surface_begin_resize(
+    struct fwr_instance *instance,
+    const FlutterPlatformMessageResponseHandle *handle,
+    struct dart_value *args) {
+  struct surface_begin_resize_message message;
+  if (!decode_surface_begin_resize_message(args, &message)) {
+    goto error;
+  }
+
+  struct fwr_view *view;
+  if (!handle_map_get(instance->views, message.surface_handle, (void **)&view) || view == NULL) {
+    goto success;
+  }
+
+  instance->input.grab.type = FWR_GRAB_RESIZE;
+  instance->input.grab.view_handle = view->handle;
+  instance->input.grab.start_cursor_x = instance->cursor->x;
+  instance->input.grab.start_cursor_y = instance->cursor->y;
+  instance->input.grab.start_view_x = view->x;
+  instance->input.grab.start_view_y = view->y;
+  instance->input.grab.start_view_width = view->width;
+  instance->input.grab.start_view_height = view->height;
+  instance->input.grab.resize_edges = (uint32_t)message.edges;
+
+  fwr_focus_view(view);
+  if (view->scene_tree != NULL) {
+    wlr_scene_node_raise_to_top(&view->scene_tree->node);
+  }
+
+success:
+  instance->fl_proc_table.SendPlatformMessageResponse(
+      instance->engine, handle, method_call_null_success,
+      sizeof(method_call_null_success));
+  return;
+
+error:
+  wlr_log(WLR_ERROR, "Invalid surface begin resize message");
+  instance->fl_proc_table.SendPlatformMessageResponse(instance->engine, handle, NULL, 0);
+}
+
