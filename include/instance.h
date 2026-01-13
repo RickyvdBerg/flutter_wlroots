@@ -125,6 +125,13 @@ struct fwr_view {
   bool fullscreen;
   bool activated;
 
+  // Flutter external texture ID for this surface (same as handle for simplicity)
+  int64_t texture_id;
+  bool texture_registered;
+
+  GLuint cached_tex;
+  GLuint cached_fbo;
+
   struct wlr_scene_tree *scene_tree;
   struct wlr_scene_tree *scene_xdg_tree;
   struct wlr_scene_rect *scene_frame;

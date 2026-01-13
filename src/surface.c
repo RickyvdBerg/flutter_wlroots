@@ -149,6 +149,17 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
   view->width = geo.width;
   view->height = geo.height;
 
+  view->texture_id = (int64_t)view->handle;
+  FlutterEngineResult result = instance->fl_proc_table.RegisterExternalTexture(
+      instance->engine, view->texture_id);
+  if (result == kSuccess) {
+    view->texture_registered = true;
+    wlr_log(WLR_INFO, "Registered external texture %ld for view %d", view->texture_id, view->handle);
+  } else {
+    wlr_log(WLR_ERROR, "Failed to register external texture for view %d", view->handle);
+    view->texture_registered = false;
+  }
+
   int32_t pid;
   uint32_t uid, gid;
   wl_client_get_credentials(view->xdg_surface->client->client, &pid, &uid, &gid);
@@ -160,10 +171,12 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
 
   msg_seg = message_builder_segment(&msg);
   struct message_builder_segment arg_seg =
-      message_builder_segment_push_map(&msg_seg, 12);
+      message_builder_segment_push_map(&msg_seg, 13);
   message_builder_segment_push_string(&arg_seg, "handle");
   wlr_log(WLR_INFO, "viewhandle %d", view->handle);
   message_builder_segment_push_int64(&arg_seg, view->handle);
+  message_builder_segment_push_string(&arg_seg, "texture_id");
+  message_builder_segment_push_int64(&arg_seg, view->texture_id);
   message_builder_segment_push_string(&arg_seg, "x");
   message_builder_segment_push_int64(&arg_seg, view->x);
   message_builder_segment_push_string(&arg_seg, "y");
@@ -271,6 +284,7 @@ static void xdg_toplevel_set_app_id(struct wl_listener *listener, void *data) {
 
 static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
   struct fwr_view *view = wl_container_of(listener, view, commit);
+  struct fwr_instance *instance = view->instance;
   
   struct wlr_box geo;
   wlr_xdg_surface_get_geometry(view->xdg_surface, &geo);
@@ -278,11 +292,29 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
   view->height = geo.height;
   
   view_update_scene(view);
+  
+  if (view->texture_registered) {
+    instance->fl_proc_table.MarkExternalTextureFrameAvailable(
+        instance->engine, view->texture_id);
+  }
 }
 
 static void xdg_toplevel_destroy(struct wl_listener *listener, void *data) {
   struct fwr_view *view = wl_container_of(listener, view, destroy);
   struct fwr_instance *instance = view->instance;
+
+  if (view->texture_registered) {
+    instance->fl_proc_table.UnregisterExternalTexture(instance->engine, view->texture_id);
+    view->texture_registered = false;
+  }
+
+  struct gl_fns *fns = &instance->fwr_renderer.fns;
+  if (view->cached_tex != 0) {
+    fns->glDeleteTextures(1, &view->cached_tex);
+  }
+  if (view->cached_fbo != 0) {
+    fns->glDeleteFramebuffers(1, &view->cached_fbo);
+  }
 
   view_destroy_scene(view);
 

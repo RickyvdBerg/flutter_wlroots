@@ -1,6 +1,5 @@
-import 'dart:collection';
-
 import 'package:compositor_dart/compositor_dart.dart';
+export 'package:compositor_dart/compositor_dart.dart' show Surface;
 import 'package:compositor_dart/constants.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
@@ -108,11 +107,7 @@ class _SurfaceViewState extends State<SurfaceView> {
               controller.setSize(size);
             }
           },
-          child: PlatformViewSurface(
-            controller: controller,
-            hitTestBehavior: PlatformViewHitTestBehavior.opaque,
-            gestureRecognizers: HashSet(),
-          ),
+          child: Texture(textureId: widget.surface.textureId),
         ),
       ),
     );

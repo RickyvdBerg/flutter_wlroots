@@ -42,6 +42,8 @@ struct gl_fns {
   void (*glUniformMatrix3fv)(GLint, GLsizei, GLboolean, const GLfloat*);
   void (*glUniform1i)(GLint, GLint);
   void (*glUniform1f)(GLint, GLfloat);
+  void (*glUniform2f)(GLint, GLfloat, GLfloat);
+  void (*glUniform4f)(GLint, GLfloat, GLfloat, GLfloat, GLfloat);
   void (*glVertexAttribPointer)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void*);
   void (*glEnableVertexAttribArray)(GLuint);
   void (*glDrawArrays)(GLenum, GLint, GLsizei);
@@ -67,6 +69,7 @@ struct gl_fns {
   void (*glGetBooleanv)(GLenum, GLboolean*);
   void (*glGetIntegerv)(GLenum, GLint*);
   void (*glReadPixels)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*);
+  void (*glViewport)(GLint, GLint, GLsizei, GLsizei);
 };
 
 struct fwr_renderer_fbo {
@@ -133,6 +136,8 @@ struct fwr_renderer {
   GLuint quad_vert_buffer;
 
   struct quad_rgbx_shader quad_rgbx_shader;
+  struct quad_rounded_shader quad_rounded_shader;
+  struct quad_external_shader quad_external_shader;
 
   bool fbo_inited;
   uint8_t current_fbo;
@@ -162,3 +167,8 @@ void fwr_renderer_init(struct fwr_instance *instance, gl_resolve_fn resolver);
 
 void fwr_renderer_render_scene(struct fwr_instance *instance, struct wlr_render_pass *render_pass);
 void fwr_renderer_update_scene_positions(struct fwr_instance *instance);
+
+GLuint fwr_renderer_copy_texture(struct fwr_instance *instance,
+                                 GLuint texture, GLenum target,
+                                 int width, int height,
+                                 GLuint *cached_tex, GLuint *cached_fbo);

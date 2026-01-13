@@ -43,6 +43,7 @@ class SurfaceGrabEndEvent {
 
 class Surface {
   final int handle;
+  final int textureId;
 
   final int pid;
   final int gid;
@@ -59,6 +60,7 @@ class Surface {
 
   Surface({
     required this.handle,
+    required this.textureId,
     required this.pid,
     required this.gid,
     required this.uid,
@@ -190,6 +192,7 @@ class Compositor {
     platform.addHandler("surface_map", (call) async {
       Surface surface = Surface(
         handle: call.arguments["handle"],
+        textureId: call.arguments["texture_id"] ?? call.arguments["handle"],
         pid: call.arguments["client_pid"],
         gid: call.arguments["client_gid"],
         uid: call.arguments["client_uid"],

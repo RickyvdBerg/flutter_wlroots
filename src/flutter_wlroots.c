@@ -102,10 +102,69 @@ static void* engine_cb_renderer_gl_proc_resolve(void *user_data, const char *nam
   return eglGetProcAddress(name);
 }
 
-//static bool EngineRendererExternalTexture(void *user_data, int64_t texture_id, size_t width, size_t height, FlutterOpenGLTexture *texture_out) {
-//  wlr_log(WLR_INFO, "EngineRendererExternalTexture");
-//  return true;
-//}
+static bool engine_cb_external_texture(void *user_data, int64_t texture_id, size_t width, size_t height, FlutterOpenGLTexture *texture_out) {
+  struct fwr_instance *instance = user_data;
+  
+  struct fwr_view *view = NULL;
+  if (!handle_map_get(instance->views, (uint32_t)texture_id, (void**)&view)) {
+    wlr_log(WLR_DEBUG, "External texture callback: view %ld not found", texture_id);
+    return false;
+  }
+  
+  if (view->xdg_surface == NULL || view->xdg_surface->surface == NULL) {
+    return false;
+  }
+  
+  struct wlr_texture *wlr_tex = wlr_surface_get_texture(view->xdg_surface->surface);
+  if (wlr_tex == NULL) {
+    return false;
+  }
+  
+  struct wlr_gles2_texture_attribs attribs;
+  wlr_gles2_texture_get_attribs(wlr_tex, &attribs);
+  
+  wlr_log(WLR_INFO, "External texture cb: tex=%d target=0x%x width=%ld height=%ld", 
+          attribs.tex, attribs.target, width, height);
+
+  if (attribs.target != GL_TEXTURE_2D) {
+    // Convert texture if needed
+    // We assume it's external OES if not 2D, or at least we need to convert it to 2D for Flutter
+    GLuint tex_2d = fwr_renderer_copy_texture(instance, attribs.tex, attribs.target,
+                                                       view->xdg_surface->surface->current.width,
+                                                       view->xdg_surface->surface->current.height,
+                                                       &view->cached_tex, &view->cached_fbo);
+#ifndef GL_RGBA8
+#define GL_RGBA8 0x8058
+#endif
+
+    if (tex_2d == 0) {
+      wlr_log(WLR_ERROR, "Copy failed for texture %d", attribs.tex);
+      return false;
+    }
+    texture_out->target = GL_TEXTURE_2D;
+    texture_out->name = tex_2d;
+  } else {
+    // Force copy even for 2D textures to ensure Flutter compatibility
+    GLuint tex_2d = fwr_renderer_copy_texture(instance, attribs.tex, attribs.target,
+                                                       view->xdg_surface->surface->current.width,
+                                                       view->xdg_surface->surface->current.height,
+                                                       &view->cached_tex, &view->cached_fbo);
+    if (tex_2d == 0) {
+      wlr_log(WLR_ERROR, "Copy failed for texture %d", attribs.tex);
+      return false;
+    }
+    texture_out->target = GL_TEXTURE_2D;
+    texture_out->name = tex_2d;
+  }
+
+  texture_out->format = GL_RGBA8;
+  texture_out->user_data = NULL;
+  texture_out->destruction_callback = NULL;
+  texture_out->width = view->xdg_surface->surface->current.width;
+  texture_out->height = view->xdg_surface->surface->current.height;
+  
+  return true;
+}
 
 static uint32_t engine_cb_renderer_fbo(void *user_data, const FlutterFrameInfo *frame_info) {
 #ifdef FLUTTER_COMPOSITOR
@@ -398,7 +457,7 @@ bool fwr_instance_create(struct fwr_instance_opts opts, struct fwr_instance **in
   renderer_config.open_gl.make_resource_current = engine_cb_renderer_make_resource_current;
   renderer_config.open_gl.fbo_reset_after_present = true;
   renderer_config.open_gl.gl_proc_resolver = engine_cb_renderer_gl_proc_resolve;
-  //renderer_config.open_gl.gl_external_texture_frame_callback = EngineRendererExternalTexture;
+  renderer_config.open_gl.gl_external_texture_frame_callback = engine_cb_external_texture;
   renderer_config.open_gl.fbo_with_frame_info_callback = engine_cb_renderer_fbo;
   renderer_config.open_gl.present_with_info = engine_cb_renderer_present;
 

@@ -30,6 +30,13 @@
 
 #define GL_BGRA_EXT 0x80E1
 
+static const GLfloat texcoords[8] = {
+  1.0f, 1.0f,
+  0.0f, 1.0f,
+  1.0f, 0.0f,
+  0.0f, 0.0f,
+};
+
 static void texture_destruction_callback(void *user_data) {}
 
 static struct fwr_renderer_page_texture* page_get_texture(struct fwr_instance *instance, size_t width, size_t height, bool make_fbo) {
@@ -237,6 +244,8 @@ void fwr_renderer_init(struct fwr_instance *instance, gl_resolve_fn resolver) {
   fns->glUniformMatrix3fv = (void (*)(GLint, GLsizei, GLboolean, const GLfloat*)) resolver("glUniformMatrix3fv");
   fns->glUniform1i = (void (*)(GLint, GLint)) resolver("glUniform1i");
   fns->glUniform1f = (void (*)(GLint, GLfloat)) resolver("glUniform1f");
+  fns->glUniform2f = (void (*)(GLint, GLfloat, GLfloat)) resolver("glUniform2f");
+  fns->glUniform4f = (void (*)(GLint, GLfloat, GLfloat, GLfloat, GLfloat)) resolver("glUniform4f");
   fns->glVertexAttribPointer = (void (*)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void*)) resolver("glVertexAttribPointer");
   fns->glEnableVertexAttribArray = (void (*)(GLuint)) resolver("glEnableVertexAttribArray");
   fns->glDrawArrays = (void (*)(GLenum, GLint, GLsizei)) resolver("glDrawArrays");
@@ -260,6 +269,7 @@ void fwr_renderer_init(struct fwr_instance *instance, gl_resolve_fn resolver) {
   fns->glGetIntegerv = (void (*)(GLenum, GLint*)) resolver("glGetIntegerv");
   fns->glGetBooleanv = (void (*)(GLenum, GLboolean*)) resolver("glGetBooleanv");
   fns->glReadPixels = (void (*)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*)) resolver("glReadPixels");
+  fns->glViewport = (void (*)(GLint, GLint, GLsizei, GLsizei)) resolver("glViewport");
 
   const char *egl_exts = eglQueryString(instance->egl_display, EGL_EXTENSIONS);
   bool ext_context_priority = strstr(egl_exts, "EGL_IMG_context_priority") != NULL;
@@ -377,17 +387,8 @@ void fwr_renderer_init(struct fwr_instance *instance, gl_resolve_fn resolver) {
   eglMakeCurrent(instance->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, instance->fwr_renderer.flutter_egl_context);
 
   renderer->quad_rgbx_shader = make_quad_rgbx_shader(instance);
-
-  const GLfloat x1 = 0.0;
-  const GLfloat x2 = 1.0;
-  const GLfloat y1 = 0.0;
-  const GLfloat y2 = 1.0;
-  const GLfloat texcoords[] = {
-    x2, y2,
-    x1, y2,
-    x2, y1,
-    x1, y1
-  };
+  renderer->quad_rounded_shader = make_quad_rounded_shader(instance);
+  renderer->quad_external_shader = make_quad_external_shader(instance);
 
   fns->glGenBuffers(1, &renderer->tex_coord_buffer);
   fns->glBindBuffer(GL_ARRAY_BUFFER, renderer->tex_coord_buffer);
@@ -569,61 +570,6 @@ static void pixman_region32_init_rounded_rect(
   }
 }
 
-static struct wlr_box flutter_transform_box(FlutterTransformation transform, struct wlr_box box) {
-  double x0 = box.x;
-  double y0 = box.y;
-  double x1 = box.x + box.width;
-  double y1 = box.y + box.height;
-
-  double tx0, ty0, tx1, ty1, tx2, ty2, tx3, ty3;
-  flutter_transform_point(transform, x0, y0, &tx0, &ty0);
-  flutter_transform_point(transform, x1, y0, &tx1, &ty1);
-  flutter_transform_point(transform, x0, y1, &tx2, &ty2);
-  flutter_transform_point(transform, x1, y1, &tx3, &ty3);
-
-  double min_x = fmin(fmin(tx0, tx1), fmin(tx2, tx3));
-  double max_x = fmax(fmax(tx0, tx1), fmax(tx2, tx3));
-  double min_y = fmin(fmin(ty0, ty1), fmin(ty2, ty3));
-  double max_y = fmax(fmax(ty0, ty1), fmax(ty2, ty3));
-
-  // IMPORTANT:
-  // Use floor/ceil instead of truncation so the box never "shrinks" as it moves
-  // through fractional coordinates. Truncation was causing subtle jitter/desync
-  // between Flutter texture layers (subpixel) and platform-view layers (int boxes).
-  //
-  // We intentionally slightly over-approximate bounds to avoid chopping a pixel
-  // off the right/bottom edges when max_* lands between pixels.
-  double ix0 = floor(min_x);
-  double iy0 = floor(min_y);
-  double ix1 = ceil(max_x);
-  double iy1 = ceil(max_y);
-
-  return (struct wlr_box){
-    .x = (int)ix0,
-    .y = (int)iy0,
-    .width = (int)(ix1 - ix0),
-    .height = (int)(iy1 - iy0),
-  };
-}
-
-static struct wlr_box intersect_boxes(struct wlr_box a, struct wlr_box b) {
-  int left = a.x > b.x ? a.x : b.x;
-  int top = a.y > b.y ? a.y : b.y;
-  int right = (a.x + a.width) < (b.x + b.width) ? (a.x + a.width) : (b.x + b.width);
-  int bottom = (a.y + a.height) < (b.y + b.height) ? (a.y + a.height) : (b.y + b.height);
-
-  if (right < left || bottom < top) {
-    return (struct wlr_box){ .x = left, .y = top, .width = 0, .height = 0 };
-  }
-
-  return (struct wlr_box){
-    .x = left,
-    .y = top,
-    .width = right - left,
-    .height = bottom - top,
-  };
-}
-
 static struct wlr_box scale_box(struct wlr_box box, double scale) {
   if (scale == 1.0) {
     return box;
@@ -643,12 +589,110 @@ struct fwr_surface_render_data {
   double output_scale;
   const pixman_region32_t *clip;
   const float *alpha;
-  // When Flutter resizes a PlatformView faster than the client can commit a new
-  // buffer, we temporarily scale the last committed client buffer to the
-  // widget size to avoid showing empty background regions.
   double content_scale_x;
   double content_scale_y;
 };
+
+struct fwr_rounded_clip {
+  bool active;
+  float rect_x;
+  float rect_y;
+  float rect_w;
+  float rect_h;
+  float radius_tl;
+  float radius_tr;
+  float radius_br;
+  float radius_bl;
+};
+
+struct fwr_rounded_render_data {
+  struct fwr_instance *instance;
+  FlutterTransformation transform;
+  double output_scale;
+  float opacity;
+  double content_scale_x;
+  double content_scale_y;
+  struct fwr_rounded_clip rounded_clip;
+};
+
+static void render_surface_rounded_iterator(struct wlr_surface *surface, int sx, int sy, void *data) {
+  struct fwr_rounded_render_data *render_data = data;
+  struct fwr_instance *instance = render_data->instance;
+  struct fwr_renderer *renderer = &instance->fwr_renderer;
+  struct gl_fns *fns = &renderer->fns;
+  struct wlr_surface_state *surface_state = &surface->current;
+  struct wlr_texture *texture = wlr_surface_get_texture(surface);
+  if (texture == NULL) {
+    return;
+  }
+
+  int output_width = 1;
+  int output_height = 1;
+  if (instance->output != NULL && instance->output->wlr_output != NULL) {
+    output_width = instance->output->wlr_output->width;
+    output_height = instance->output->wlr_output->height;
+  }
+
+  double left = (double)sx * render_data->content_scale_x;
+  double top = (double)sy * render_data->content_scale_y;
+  double right = left + (double)surface_state->width * render_data->content_scale_x;
+  double bottom = top + (double)surface_state->height * render_data->content_scale_y;
+
+  struct wlr_box dst_box = flutter_transform_rect(render_data->transform, left, top, right, bottom);
+  dst_box = scale_box(dst_box, render_data->output_scale);
+
+  float ndc_left = ((float)dst_box.x / (float)output_width) * 2.0f - 1.0f;
+  float ndc_right = ((float)(dst_box.x + dst_box.width) / (float)output_width) * 2.0f - 1.0f;
+  float ndc_top = 1.0f - ((float)dst_box.y / (float)output_height) * 2.0f;
+  float ndc_bottom = 1.0f - ((float)(dst_box.y + dst_box.height) / (float)output_height) * 2.0f;
+
+  const GLfloat verts[8] = {
+    ndc_right, ndc_bottom,
+    ndc_left, ndc_bottom,
+    ndc_right, ndc_top,
+    ndc_left, ndc_top,
+  };
+
+  const GLfloat texcoords[8] = {
+    1.0f, 1.0f,
+    0.0f, 1.0f,
+    1.0f, 0.0f,
+    0.0f, 0.0f,
+  };
+
+  struct quad_rounded_shader *shader = &renderer->quad_rounded_shader;
+  fns->glUseProgram(shader->prog);
+
+  fns->glEnable(GL_BLEND);
+  fns->glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+
+  fns->glActiveTexture(GL_TEXTURE0);
+  struct wlr_gles2_texture_attribs tex_attribs;
+  wlr_gles2_texture_get_attribs(texture, &tex_attribs);
+  fns->glBindTexture(tex_attribs.target, tex_attribs.tex);
+  fns->glUniform1i(shader->tex, 0);
+
+  fns->glUniform1f(shader->alpha, render_data->opacity);
+
+  struct fwr_rounded_clip *rc = &render_data->rounded_clip;
+  fns->glUniform4f(shader->clip_rect, rc->rect_x, rc->rect_y, rc->rect_w, rc->rect_h);
+  fns->glUniform4f(shader->corner_radii, rc->radius_tl, rc->radius_tr, rc->radius_br, rc->radius_bl);
+  fns->glUniform1f(shader->output_height, (float)output_height);
+
+  fns->glEnableVertexAttribArray(shader->pos_attrib);
+  fns->glVertexAttribPointer(shader->pos_attrib, 2, GL_FLOAT, GL_FALSE, 0, verts);
+
+  fns->glEnableVertexAttribArray(shader->tex_attrib);
+  fns->glVertexAttribPointer(shader->tex_attrib, 2, GL_FLOAT, GL_FALSE, 0, texcoords);
+
+  fns->glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+  fns->glDisableVertexAttribArray(shader->pos_attrib);
+  fns->glDisableVertexAttribArray(shader->tex_attrib);
+  fns->glBindTexture(GL_TEXTURE_2D, 0);
+  fns->glUseProgram(0);
+  fns->glDisable(GL_BLEND);
+}
 
 static void render_surface_iterator(struct wlr_surface *surface, int sx, int sy, void *data) {
   struct fwr_surface_render_data *render_data = data;
@@ -731,6 +775,8 @@ static void render_scene_layer_platform(struct fwr_instance *instance, struct wl
   FlutterTransformation current_transform = {1, 0, 0, 0, 1, 0, 0, 0, 1};
   bool transform_affine = true;
   bool has_clip = false;
+  bool has_rounded_clip = false;
+  struct fwr_rounded_clip rounded_clip = {0};
   pixman_region32_t clip_region;
 
   for (int m = 0; m < layer->platform.mutations_count; m++) {
@@ -784,10 +830,31 @@ static void render_scene_layer_platform(struct fwr_instance *instance, struct wl
           mutation->clip_rounded_rect.rect.bottom
         );
         mutation_box = scale_box(mutation_box, output_scale);
-        pixman_region32_t tmp;
 
         bool disable_radius = view->maximized || view->fullscreen;
-        if (disable_radius) {
+        
+        float r_tl = (float)(mutation->clip_rounded_rect.upper_left_corner_radius.width * output_scale);
+        float r_tr = (float)(mutation->clip_rounded_rect.upper_right_corner_radius.width * output_scale);
+        float r_br = (float)(mutation->clip_rounded_rect.lower_right_corner_radius.width * output_scale);
+        float r_bl = (float)(mutation->clip_rounded_rect.lower_left_corner_radius.width * output_scale);
+        
+        bool has_any_radius = !disable_radius && (r_tl > 0.5f || r_tr > 0.5f || r_br > 0.5f || r_bl > 0.5f);
+        
+        if (has_any_radius && !has_rounded_clip) {
+          has_rounded_clip = true;
+          rounded_clip.active = true;
+          rounded_clip.rect_x = (float)mutation_box.x;
+          rounded_clip.rect_y = (float)mutation_box.y;
+          rounded_clip.rect_w = (float)mutation_box.width;
+          rounded_clip.rect_h = (float)mutation_box.height;
+          rounded_clip.radius_tl = r_tl;
+          rounded_clip.radius_tr = r_tr;
+          rounded_clip.radius_br = r_br;
+          rounded_clip.radius_bl = r_bl;
+        }
+
+        pixman_region32_t tmp;
+        if (disable_radius || !has_any_radius) {
           pixman_region32_init_rect(&tmp, mutation_box.x, mutation_box.y, mutation_box.width, mutation_box.height);
         } else {
           int r_tl_x = (int)lround(mutation->clip_rounded_rect.upper_left_corner_radius.width * output_scale);
@@ -860,17 +927,31 @@ static void render_scene_layer_platform(struct fwr_instance *instance, struct wl
       (double)current_transform.transY);
   }
 
-  struct fwr_surface_render_data render_data = {
-    .render_pass = render_pass,
-    .transform = current_transform,
-    .output_scale = output_scale,
-    .clip = has_clip ? &clip_region : NULL,
-    .alpha = &opacity,
-    .content_scale_x = content_scale_x,
-    .content_scale_y = content_scale_y,
-  };
+  if (has_rounded_clip && rounded_clip.active) {
+    struct fwr_rounded_render_data rounded_render_data = {
+      .instance = instance,
+      .transform = current_transform,
+      .output_scale = output_scale,
+      .opacity = opacity,
+      .content_scale_x = content_scale_x,
+      .content_scale_y = content_scale_y,
+      .rounded_clip = rounded_clip,
+    };
 
-  wlr_surface_for_each_surface(view->xdg_surface->surface, render_surface_iterator, &render_data);
+    wlr_surface_for_each_surface(view->xdg_surface->surface, render_surface_rounded_iterator, &rounded_render_data);
+  } else {
+    struct fwr_surface_render_data render_data = {
+      .render_pass = render_pass,
+      .transform = current_transform,
+      .output_scale = output_scale,
+      .clip = has_clip ? &clip_region : NULL,
+      .alpha = &opacity,
+      .content_scale_x = content_scale_x,
+      .content_scale_y = content_scale_y,
+    };
+
+    wlr_surface_for_each_surface(view->xdg_surface->surface, render_surface_iterator, &render_data);
+  }
 
   if (has_clip) {
     pixman_region32_fini(&clip_region);
@@ -879,6 +960,117 @@ static void render_scene_layer_platform(struct fwr_instance *instance, struct wl
   wlr_presentation_surface_textured_on_output(view->xdg_surface->surface, instance->output->wlr_output);
   wlr_surface_send_frame_done(view->xdg_surface->surface, now);
 }
+
+#ifndef GL_TEXTURE_EXTERNAL_OES
+#define GL_TEXTURE_EXTERNAL_OES 0x8D65
+#endif
+
+GLuint fwr_renderer_copy_texture(struct fwr_instance *instance,
+                                 GLuint texture, GLenum target,
+                                 int width, int height,
+                                 GLuint *cached_tex, GLuint *cached_fbo) {
+  if (eglGetCurrentContext() == EGL_NO_CONTEXT) {
+    wlr_log(WLR_ERROR, "No current EGL context in copy_texture!");
+    return 0;
+  }
+
+  wlr_log(WLR_INFO, "Copying texture %d (target 0x%x) %dx%d", texture, target, width, height);
+  struct fwr_renderer *renderer = &instance->fwr_renderer;
+  struct gl_fns *fns = &renderer->fns;
+
+  // Create texture if needed
+  if (*cached_tex == 0) {
+    fns->glGenTextures(1, cached_tex);
+    if (*cached_tex == 0) {
+      wlr_log(WLR_ERROR, "glGenTextures failed");
+      return 0;
+    }
+    fns->glBindTexture(GL_TEXTURE_2D, *cached_tex);
+    fns->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    fns->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    fns->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    fns->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    fns->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+  } else {
+    // Reallocate (simple approach)
+    fns->glBindTexture(GL_TEXTURE_2D, *cached_tex);
+    fns->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+  }
+
+  // Create FBO if needed
+  if (*cached_fbo == 0) {
+    fns->glGenFramebuffers(1, cached_fbo);
+  }
+
+  // Bind FBO and attach texture
+  fns->glBindFramebuffer(GL_FRAMEBUFFER, *cached_fbo);
+  fns->glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, *cached_tex, 0);
+
+  GLenum status = fns->glCheckFramebufferStatus(GL_FRAMEBUFFER);
+  if (status != GL_FRAMEBUFFER_COMPLETE) {
+    wlr_log(WLR_ERROR, "Framebuffer incomplete: 0x%x, tex: %d, fbo: %d, ext: %d", status, *cached_tex, *cached_fbo, texture);
+    fns->glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    return 0;
+  }
+
+  GLint viewport[4];
+  fns->glGetIntegerv(GL_VIEWPORT, viewport);
+  fns->glViewport(0, 0, width, height);
+
+  GLint old_prog;
+  fns->glGetIntegerv(GL_CURRENT_PROGRAM, &old_prog);
+
+  GLuint prog;
+  GLint tex_loc, pos_loc, tex_attrib_loc;
+
+  if (target == GL_TEXTURE_EXTERNAL_OES) {
+     prog = renderer->quad_external_shader.prog;
+     tex_loc = renderer->quad_external_shader.tex;
+     pos_loc = renderer->quad_external_shader.pos_attrib;
+     tex_attrib_loc = renderer->quad_external_shader.tex_attrib;
+  } else {
+     prog = renderer->quad_rgbx_shader.prog;
+     tex_loc = renderer->quad_rgbx_shader.tex;
+     pos_loc = renderer->quad_rgbx_shader.pos_attrib;
+     tex_attrib_loc = renderer->quad_rgbx_shader.tex_attrib;
+  }
+
+  fns->glUseProgram(prog);
+
+  fns->glActiveTexture(GL_TEXTURE0);
+  fns->glBindTexture(target, texture);
+  fns->glUniform1i(tex_loc, 0);
+
+  fns->glBindBuffer(GL_ARRAY_BUFFER, renderer->quad_vert_buffer);
+  fns->glVertexAttribPointer(pos_loc, 2, GL_FLOAT, GL_FALSE, 0, NULL);
+  fns->glEnableVertexAttribArray(pos_loc);
+
+  static const GLfloat copy_texcoords[] = {
+    1.0f, 0.0f,
+    0.0f, 0.0f,
+    1.0f, 1.0f,
+    0.0f, 1.0f,
+  };
+
+  fns->glBindBuffer(GL_ARRAY_BUFFER, 0);
+  fns->glVertexAttribPointer(tex_attrib_loc, 2, GL_FLOAT, GL_FALSE, 0, copy_texcoords);
+  fns->glEnableVertexAttribArray(tex_attrib_loc);
+
+  fns->glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+  fns->glDisableVertexAttribArray(pos_loc);
+  fns->glDisableVertexAttribArray(tex_attrib_loc);
+
+  fns->glUseProgram(old_prog);
+  fns->glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  fns->glBindTexture(target, 0);
+  fns->glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+
+  wlr_log(WLR_INFO, "Copy done. Result tex: %d", *cached_tex);
+  return *cached_tex;
+}
+
+
 
 static void render_scene_layer_texture(struct fwr_instance *instance, struct wlr_render_pass *render_pass, struct fwr_renderer_scene_layer *layer) {
   struct fwr_renderer *renderer = &instance->fwr_renderer;
