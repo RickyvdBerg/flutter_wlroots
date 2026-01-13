@@ -55,9 +55,12 @@
 
 #define WRITE_ALIGN_TO(STATE, N) \
     do {\
-        int num = N - (STATE->buffer_len % N);\
-        for (int i = 0; i < num; i++) {\
-            STATE->buffer[STATE->buffer_len++] = 0;\
+        int mod = STATE->buffer_len % N;\
+        if (mod != 0) {\
+            int num = N - mod;\
+            for (int i = 0; i < num; i++) {\
+                STATE->buffer[STATE->buffer_len++] = 0;\
+            }\
         }\
     } while (0);
 
@@ -173,9 +176,9 @@ void message_builder_segment_push_float64(struct message_builder_segment *segmen
     ASSERT_LEVEL(segment);
 
     struct message_builder_state *state = segment->state;
-    reserve(state, 1 + sizeof(double)*2);
-    WRITE_ALIGN_TO(state, 8)
+    reserve(state, 1 + 8 + sizeof(double));
     state->buffer[state->buffer_len++] = kValueFloat64;
+    WRITE_ALIGN_TO(state, 8)
     ((double*) (state->buffer + state->buffer_len))[0] = value;
     state->buffer_len += sizeof(double);
     segment->written += 1;
@@ -374,9 +377,12 @@ void message_builder_segment_finish(struct message_builder_segment *segment) {
 
 #define READ_ALIGN_TO(N) \
     do {\
-        int num = N - (*offset % N);\
-        REQUIRE_DATA(num);\
-        *offset += num;\
+        int mod = *offset % N;\
+        if (mod != 0) {\
+            int num = N - mod;\
+            REQUIRE_DATA(num);\
+            *offset += num;\
+        }\
     } while (0);
 
 bool message_read(const uint8_t *buffer, size_t length, size_t *offset, struct dart_value *out) {
