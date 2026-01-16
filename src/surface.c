@@ -457,25 +457,8 @@ static void xdg_toplevel_destroy(struct wl_listener *listener, void *data) {
     view->texture_registered = false;
   }
 
-  // Delete GL resources - must bind correct EGL context first
-  if (view->cached_tex != 0 || view->cached_fbo != 0) {
-    EGLContext prev_ctx = eglGetCurrentContext();
-    eglMakeCurrent(instance->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
-                   instance->fwr_renderer.flutter_egl_context);
-
-    struct gl_fns *fns = &instance->fwr_renderer.fns;
-    if (view->cached_tex != 0) {
-      fns->glDeleteTextures(1, &view->cached_tex);
-      view->cached_tex = 0;
-    }
-    if (view->cached_fbo != 0) {
-      fns->glDeleteFramebuffers(1, &view->cached_fbo);
-      view->cached_fbo = 0;
-    }
-
-    // Restore previous context
-    eglMakeCurrent(instance->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, prev_ctx);
-  }
+  // Delete GL resources
+  fwr_cached_texture_destroy(instance, &view->cache);
 
   view_destroy_scene(view);
 
@@ -1088,24 +1071,8 @@ static void subsurface_handle_destroy(struct wl_listener *listener, void *data) 
     sub->texture_registered = false;
   }
 
-  // Clean up cached GL resources - must bind correct EGL context first
-  if (sub->cached_tex != 0 || sub->cached_fbo != 0) {
-    EGLContext prev_ctx = eglGetCurrentContext();
-    eglMakeCurrent(instance->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
-                   instance->fwr_renderer.flutter_egl_context);
-
-    struct gl_fns *fns = &instance->fwr_renderer.fns;
-    if (sub->cached_tex != 0) {
-      fns->glDeleteTextures(1, &sub->cached_tex);
-      sub->cached_tex = 0;
-    }
-    if (sub->cached_fbo != 0) {
-      fns->glDeleteFramebuffers(1, &sub->cached_fbo);
-      sub->cached_fbo = 0;
-    }
-
-    eglMakeCurrent(instance->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, prev_ctx);
-  }
+  // Clean up cached GL resources
+  fwr_cached_texture_destroy(instance, &sub->cache);
 
   // Remove from handle map
   handle_map_remove(instance->subsurfaces, sub->handle);
@@ -1319,24 +1286,8 @@ static void popup_handle_destroy(struct wl_listener *listener, void *data) {
     popup->texture_registered = false;
   }
 
-  // Clean up cached GL resources - must bind correct EGL context first
-  if (popup->cached_tex != 0 || popup->cached_fbo != 0) {
-    EGLContext prev_ctx = eglGetCurrentContext();
-    eglMakeCurrent(instance->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
-                   instance->fwr_renderer.flutter_egl_context);
-
-    struct gl_fns *fns = &instance->fwr_renderer.fns;
-    if (popup->cached_tex != 0) {
-      fns->glDeleteTextures(1, &popup->cached_tex);
-      popup->cached_tex = 0;
-    }
-    if (popup->cached_fbo != 0) {
-      fns->glDeleteFramebuffers(1, &popup->cached_fbo);
-      popup->cached_fbo = 0;
-    }
-
-    eglMakeCurrent(instance->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, prev_ctx);
-  }
+  // Clean up cached GL resources
+  fwr_cached_texture_destroy(instance, &popup->cache);
 
   wl_list_remove(&popup->map.link);
   wl_list_remove(&popup->unmap.link);

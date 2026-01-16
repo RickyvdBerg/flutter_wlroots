@@ -24,6 +24,14 @@ struct wlr_scene_tree;
 struct wlr_scene_rect;
 struct wlr_output_layout_output;
 
+// Cached texture for zero-copy or copy-based texture sharing
+struct fwr_cached_texture {
+  GLuint tex;
+  GLuint fbo;
+  int width;
+  int height;
+};
+
 struct fwr_instance {
   struct wl_display *wl_display;
   struct wl_event_loop *wl_event_loop;
@@ -157,10 +165,7 @@ struct fwr_view {
   int64_t texture_id;
   bool texture_registered;
 
-  GLuint cached_tex;
-  GLuint cached_fbo;
-  int cached_tex_width;
-  int cached_tex_height;
+  struct fwr_cached_texture cache;
 
   // Subsurface tracking
   struct wl_list subsurfaces;  // List of fwr_subsurface
@@ -209,10 +214,7 @@ struct fwr_subsurface {
   int64_t texture_id;
   bool texture_registered;
 
-  GLuint cached_tex;
-  GLuint cached_fbo;
-  int cached_tex_width;
-  int cached_tex_height;
+  struct fwr_cached_texture cache;
 
   struct wl_listener map;
   struct wl_listener unmap;
@@ -243,10 +245,7 @@ struct fwr_popup {
   bool texture_registered;
   bool unconstrained;  // Whether unconstrain has been called
 
-  GLuint cached_tex;
-  GLuint cached_fbo;
-  int cached_tex_width;
-  int cached_tex_height;
+  struct fwr_cached_texture cache;
 
   struct wl_listener map;
   struct wl_listener unmap;

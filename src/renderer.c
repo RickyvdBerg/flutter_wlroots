@@ -965,11 +965,35 @@ static void render_scene_layer_platform(struct fwr_instance *instance, struct wl
 #define GL_TEXTURE_EXTERNAL_OES 0x8D65
 #endif
 
+void fwr_cached_texture_destroy(struct fwr_instance *instance,
+                                struct fwr_cached_texture *cache) {
+  if (cache->tex == 0 && cache->fbo == 0) {
+    return;
+  }
+
+  EGLContext prev_ctx = eglGetCurrentContext();
+  eglMakeCurrent(instance->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                 instance->fwr_renderer.flutter_egl_context);
+
+  struct gl_fns *fns = &instance->fwr_renderer.fns;
+  if (cache->tex != 0) {
+    fns->glDeleteTextures(1, &cache->tex);
+    cache->tex = 0;
+  }
+  if (cache->fbo != 0) {
+    fns->glDeleteFramebuffers(1, &cache->fbo);
+    cache->fbo = 0;
+  }
+  cache->width = 0;
+  cache->height = 0;
+
+  eglMakeCurrent(instance->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, prev_ctx);
+}
+
 GLuint fwr_renderer_copy_texture(struct fwr_instance *instance,
                                  GLuint texture, GLenum target,
                                  int width, int height,
-                                 GLuint *cached_tex, GLuint *cached_fbo,
-                                 int *cached_width, int *cached_height) {
+                                 struct fwr_cached_texture *cache) {
   if (eglGetCurrentContext() == EGL_NO_CONTEXT) {
     wlr_log(WLR_ERROR, "No current EGL context in copy_texture!");
     return 0;
@@ -979,44 +1003,44 @@ GLuint fwr_renderer_copy_texture(struct fwr_instance *instance,
   struct gl_fns *fns = &renderer->fns;
 
   // Check if we need to (re)create texture
-  bool need_alloc = (*cached_tex == 0) ||
-                    (cached_width && *cached_width != width) ||
-                    (cached_height && *cached_height != height);
+  bool need_alloc = (cache->tex == 0) ||
+                    (cache->width != width) ||
+                    (cache->height != height);
 
-  if (*cached_tex == 0) {
-    fns->glGenTextures(1, cached_tex);
-    if (*cached_tex == 0) {
+  if (cache->tex == 0) {
+    fns->glGenTextures(1, &cache->tex);
+    if (cache->tex == 0) {
       wlr_log(WLR_ERROR, "glGenTextures failed");
       return 0;
     }
-    fns->glBindTexture(GL_TEXTURE_2D, *cached_tex);
+    fns->glBindTexture(GL_TEXTURE_2D, cache->tex);
     fns->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     fns->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     fns->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     fns->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
   } else {
-    fns->glBindTexture(GL_TEXTURE_2D, *cached_tex);
+    fns->glBindTexture(GL_TEXTURE_2D, cache->tex);
   }
 
   // Only reallocate texture storage if size changed
   if (need_alloc) {
     fns->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-    if (cached_width) *cached_width = width;
-    if (cached_height) *cached_height = height;
+    cache->width = width;
+    cache->height = height;
   }
 
   // Create FBO if needed
-  if (*cached_fbo == 0) {
-    fns->glGenFramebuffers(1, cached_fbo);
+  if (cache->fbo == 0) {
+    fns->glGenFramebuffers(1, &cache->fbo);
   }
 
   // Bind FBO and attach texture
-  fns->glBindFramebuffer(GL_FRAMEBUFFER, *cached_fbo);
-  fns->glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, *cached_tex, 0);
+  fns->glBindFramebuffer(GL_FRAMEBUFFER, cache->fbo);
+  fns->glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, cache->tex, 0);
 
   GLenum status = fns->glCheckFramebufferStatus(GL_FRAMEBUFFER);
   if (status != GL_FRAMEBUFFER_COMPLETE) {
-    wlr_log(WLR_ERROR, "Framebuffer incomplete: 0x%x, tex: %d, fbo: %d, ext: %d", status, *cached_tex, *cached_fbo, texture);
+    wlr_log(WLR_ERROR, "Framebuffer incomplete: 0x%x, tex: %d, fbo: %d, ext: %d", status, cache->tex, cache->fbo, texture);
     fns->glBindFramebuffer(GL_FRAMEBUFFER, 0);
     return 0;
   }
@@ -1082,8 +1106,8 @@ GLuint fwr_renderer_copy_texture(struct fwr_instance *instance,
   fns->glBindTexture(target, 0);
   fns->glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
 
-  // wlr_log(WLR_DEBUG, "Copy done. Result tex: %d", *cached_tex);
-  return *cached_tex;
+  // wlr_log(WLR_DEBUG, "Copy done. Result tex: %d", cache->tex);
+  return cache->tex;
 }
 
 

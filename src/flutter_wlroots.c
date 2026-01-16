@@ -205,8 +205,7 @@ static void* engine_cb_renderer_gl_proc_resolve(void *user_data, const char *nam
 // Helper function to provide texture for a wlr_surface
 static bool provide_surface_texture(struct fwr_instance *instance,
                                     struct wlr_surface *surface,
-                                    GLuint *cached_tex, GLuint *cached_fbo,
-                                    int *cached_width, int *cached_height,
+                                    struct fwr_cached_texture *cache,
                                     FlutterOpenGLTexture *texture_out) {
   struct wlr_texture *wlr_tex = wlr_surface_get_texture(surface);
   if (wlr_tex == NULL) {
@@ -228,8 +227,7 @@ static bool provide_surface_texture(struct fwr_instance *instance,
   GLuint tex_2d = fwr_renderer_copy_texture(instance, attribs.tex, attribs.target,
                                              surface->current.width,
                                              surface->current.height,
-                                             cached_tex, cached_fbo,
-                                             cached_width, cached_height);
+                                             cache);
   if (tex_2d == 0) {
     wlr_log(WLR_ERROR, "Copy failed for texture %d", attribs.tex);
     return false;
@@ -258,9 +256,7 @@ static bool engine_cb_external_texture(void *user_data, int64_t texture_id, size
     // Per-frame logging - too verbose
     // wlr_log(WLR_DEBUG, "External texture cb: view %d", view->handle);
     return provide_surface_texture(instance, view->xdg_surface->surface,
-                                   &view->cached_tex, &view->cached_fbo,
-                                   &view->cached_tex_width, &view->cached_tex_height,
-                                   texture_out);
+                                   &view->cache, texture_out);
   }
 
   // If not a view, try to find a subsurface
@@ -273,9 +269,7 @@ static bool engine_cb_external_texture(void *user_data, int64_t texture_id, size
         return false;
       }
       return provide_surface_texture(instance, sub->surface,
-                                     &sub->cached_tex, &sub->cached_fbo,
-                                     &sub->cached_tex_width, &sub->cached_tex_height,
-                                     texture_out);
+                                     &sub->cache, texture_out);
     }
   }
 
@@ -322,9 +316,7 @@ static bool engine_cb_external_texture(void *user_data, int64_t texture_id, size
         return false;
       }
       bool result = provide_surface_texture(instance, content_surface,
-                                     &popup->cached_tex, &popup->cached_fbo,
-                                     &popup->cached_tex_width, &popup->cached_tex_height,
-                                     texture_out);
+                                     &popup->cache, texture_out);
       // Mark frame available again to ensure Flutter keeps requesting updates
       // This ensures we catch subsurface content that arrives after initial request
       if (result && popup->texture_registered) {

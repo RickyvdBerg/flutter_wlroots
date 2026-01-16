@@ -12,6 +12,7 @@
 #include <wlr/types/wlr_buffer.h>
 
 struct fwr_instance;
+struct fwr_cached_texture;
 struct wlr_render_pass;
 struct wlr_scene_buffer;
 
@@ -168,8 +169,10 @@ void fwr_renderer_init(struct fwr_instance *instance, gl_resolve_fn resolver);
 void fwr_renderer_render_scene(struct fwr_instance *instance, struct wlr_render_pass *render_pass);
 void fwr_renderer_update_scene_positions(struct fwr_instance *instance);
 
+void fwr_cached_texture_destroy(struct fwr_instance *instance,
+                                struct fwr_cached_texture *cache);
+
 GLuint fwr_renderer_copy_texture(struct fwr_instance *instance,
                                  GLuint texture, GLenum target,
                                  int width, int height,
-                                 GLuint *cached_tex, GLuint *cached_fbo,
-                                 int *cached_width, int *cached_height);
+                                 struct fwr_cached_texture *cache);
