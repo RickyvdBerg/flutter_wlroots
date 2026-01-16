@@ -30,6 +30,7 @@ struct fwr_cached_texture {
   GLuint fbo;
   int width;
   int height;
+  uint32_t last_seq;  // Surface commit sequence - skip copy if unchanged
 };
 
 struct fwr_instance {

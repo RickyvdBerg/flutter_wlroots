@@ -986,6 +986,7 @@ void fwr_cached_texture_destroy(struct fwr_instance *instance,
   }
   cache->width = 0;
   cache->height = 0;
+  cache->last_seq = 0;
 
   eglMakeCurrent(instance->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, prev_ctx);
 }
@@ -1053,9 +1054,11 @@ GLuint fwr_renderer_copy_texture(struct fwr_instance *instance,
   fns->glDisable(GL_BLEND);
   fns->glDisable(GL_SCISSOR_TEST);
 
-  // Clear to fully transparent - critical for alpha shadows
-  fns->glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
-  fns->glClear(GL_COLOR_BUFFER_BIT);
+  // Only clear on allocation - subsequent copies overwrite entire texture
+  if (need_alloc) {
+    fns->glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    fns->glClear(GL_COLOR_BUFFER_BIT);
+  }
 
   GLint old_prog;
   fns->glGetIntegerv(GL_CURRENT_PROGRAM, &old_prog);

@@ -212,16 +212,32 @@ static bool provide_surface_texture(struct fwr_instance *instance,
     return false;
   }
 
-  struct wlr_gles2_texture_attribs attribs;
-  wlr_gles2_texture_get_attribs(wlr_tex, &attribs);
-
-  wlr_log(WLR_DEBUG, "provide_surface_texture: surface=%dx%d, tex=%d, target=0x%x, has_alpha=%d",
-          surface->current.width, surface->current.height,
-          attribs.tex, attribs.target, attribs.has_alpha);
-
 #ifndef GL_RGBA8
 #define GL_RGBA8 0x8058
 #endif
+
+  // Check if content changed since last copy (optimization: skip copy if unchanged)
+  uint32_t current_seq = surface->current.seq;
+  if (cache->tex != 0 && cache->last_seq == current_seq &&
+      cache->width == surface->current.width &&
+      cache->height == surface->current.height) {
+    // Content unchanged - reuse cached texture
+    texture_out->target = GL_TEXTURE_2D;
+    texture_out->name = cache->tex;
+    texture_out->format = GL_RGBA8;
+    texture_out->user_data = NULL;
+    texture_out->destruction_callback = NULL;
+    texture_out->width = cache->width;
+    texture_out->height = cache->height;
+    return true;
+  }
+
+  struct wlr_gles2_texture_attribs attribs;
+  wlr_gles2_texture_get_attribs(wlr_tex, &attribs);
+
+  wlr_log(WLR_DEBUG, "provide_surface_texture: surface=%dx%d, tex=%d, target=0x%x, seq=%u",
+          surface->current.width, surface->current.height,
+          attribs.tex, attribs.target, current_seq);
 
   // Copy texture to ensure Flutter compatibility
   GLuint tex_2d = fwr_renderer_copy_texture(instance, attribs.tex, attribs.target,
@@ -232,6 +248,9 @@ static bool provide_surface_texture(struct fwr_instance *instance,
     wlr_log(WLR_ERROR, "Copy failed for texture %d", attribs.tex);
     return false;
   }
+
+  // Update sequence tracking
+  cache->last_seq = current_seq;
 
   texture_out->target = GL_TEXTURE_2D;
   texture_out->name = tex_2d;
