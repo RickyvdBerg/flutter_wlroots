@@ -146,38 +146,6 @@ static void process_cursor_motion(struct fwr_instance *instance, uint32_t time) 
     return;
   }
 
-  // Popup grab active - send motion directly to seat (bypasses Flutter's IgnorePointer on popups)
-  bool has_popup_grab = (instance->seat->pointer_state.grab !=
-                         instance->seat->pointer_state.default_grab);
-  if (has_popup_grab) {
-    // Use scene graph to find surface under cursor
-    double sx = 0.0, sy = 0.0;
-    struct wlr_scene_node *node = wlr_scene_node_at(
-        &instance->scene->tree.node, instance->cursor->x, instance->cursor->y, &sx, &sy);
-
-    if (node != NULL && node->type == WLR_SCENE_NODE_BUFFER) {
-      struct wlr_scene_buffer *scene_buffer = wlr_scene_buffer_from_node(node);
-      struct wlr_scene_surface *scene_surface = wlr_scene_surface_try_from_buffer(scene_buffer);
-      if (scene_surface != NULL) {
-        struct wlr_surface *surface = scene_surface->surface;
-        // Traverse to find subsurface if any (Firefox renders to subsurfaces)
-        double sub_x, sub_y;
-        struct wlr_surface *leaf = wlr_surface_surface_at(surface, sx, sy, &sub_x, &sub_y);
-        if (leaf != NULL) {
-          surface = leaf;
-          sx = sub_x;
-          sy = sub_y;
-        }
-        wlr_seat_pointer_notify_motion(instance->seat, time, sx, sy);
-        wlr_seat_pointer_notify_frame(instance->seat);
-      }
-    }
-    // Also send to Flutter for visual feedback (cursor shape etc)
-    FlutterPointerPhase phase = instance->input.fl_mouse_button_mask != 0 ? kMove : kHover;
-    send_flutter_mouse_event(instance, phase, kFlutterPointerSignalKindNone, 0.0, 0.0);
-    return;
-  }
-
   // Direct input mode - bypass Flutter for low-latency gaming
   if (instance->direct_input_mode && instance->direct_input_surface != 0) {
     struct fwr_view *view;
@@ -279,16 +247,6 @@ static void on_server_cursor_axis(struct wl_listener *listener, void *data) {
   struct fwr_instance *instance = wl_container_of(listener, instance, cursor_axis);
   struct wlr_pointer_axis_event *event = data;
 
-  // Popup grab active - send scroll directly to seat (bypasses Flutter's IgnorePointer on popups)
-  bool has_popup_grab = (instance->seat->pointer_state.grab !=
-                         instance->seat->pointer_state.default_grab);
-  if (has_popup_grab) {
-    wlr_seat_pointer_notify_axis(instance->seat, event->time_msec, event->orientation,
-        event->delta, event->delta_discrete, event->source, event->relative_direction);
-    wlr_seat_pointer_notify_frame(instance->seat);
-    return;
-  }
-
   // Direct input mode - bypass Flutter for low-latency gaming
   if (instance->direct_input_mode && instance->direct_input_surface != 0) {
     struct fwr_view *view;
@@ -300,8 +258,10 @@ static void on_server_cursor_axis(struct wl_listener *listener, void *data) {
     }
   }
 
-  // Flutter-first: Send all scroll events to Flutter
-  // Flutter's widget tree does hit testing and forwards to surfaces as needed
+  // Scroll events use hybrid approach: send directly to focused surface AND to Flutter
+  // This is necessary because Flutter's onPointerSignal doesn't reliably receive scroll
+  // events from the embedder. The direct seat notification ensures Wayland clients
+  // receive scroll, while Flutter gets it for UI feedback (scroll indicators, etc.)
   double scroll_delta_x = 0.0;
   double scroll_delta_y = 0.0;
   if (event->orientation == WL_POINTER_AXIS_HORIZONTAL_SCROLL) {
@@ -310,7 +270,13 @@ static void on_server_cursor_axis(struct wl_listener *listener, void *data) {
     scroll_delta_y = -event->delta;
   }
 
+  // Send to Flutter for UI feedback
   send_flutter_mouse_event(instance, kHover, kFlutterPointerSignalKindScroll, scroll_delta_x, scroll_delta_y);
+
+  // Send directly to wlroots seat for Wayland client
+  wlr_seat_pointer_notify_axis(instance->seat, event->time_msec, event->orientation,
+      event->delta, event->delta_discrete, event->source, event->relative_direction);
+  wlr_seat_pointer_notify_frame(instance->seat);
 }
 
 static void on_server_cursor_frame(struct wl_listener *listener, void *data) {
@@ -1058,6 +1024,8 @@ void fwr_handle_surface_pointer_event_message(
     set_surface_buttons(message.surface_handle, next_buttons);
     wlr_seat_pointer_notify_frame(instance->seat);
   } else if (message.event_type == pointerScrollEvent) {
+    // Note: Scroll events are also sent directly via on_server_cursor_axis using
+    // hybrid approach, so this path may not be reached. Kept for completeness.
     wlr_seat_pointer_notify_enter(instance->seat, surface, local_x, local_y);
 
     if (message.scroll_delta_x != 0.0) {
@@ -1177,6 +1145,8 @@ void fwr_handle_popup_pointer_event_message(
     set_surface_buttons(message.surface_handle + 200000, next_buttons);
     wlr_seat_pointer_notify_frame(instance->seat);
   } else if (message.event_type == pointerScrollEvent) {
+    // Note: Scroll events are also sent directly via on_server_cursor_axis using
+    // hybrid approach, so this path may not be reached. Kept for completeness.
     wlr_seat_pointer_notify_enter(instance->seat, surface, local_x, local_y);
 
     if (message.scroll_delta_x != 0.0) {

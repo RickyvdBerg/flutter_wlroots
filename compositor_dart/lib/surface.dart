@@ -45,6 +45,92 @@ class _MeasureSize extends SingleChildRenderObjectWidget {
   }
 }
 
+/// Shared mixin for encoding pointer events to the platform channel format.
+/// Used by both surface and popup event dispatchers.
+mixin _PointerEventEncoder {
+  /// Encode a PointerEvent into the list format expected by the C side.
+  /// Returns the encoded data list ready for platform channel invocation.
+  List encodePointerEvent({
+    required int handle,
+    required PointerEvent event,
+    required Size widgetSize,
+    Offset Function(Offset)? coordTransform,
+  }) {
+    final int deviceKind;
+    switch (event.kind) {
+      case PointerDeviceKind.mouse:
+        deviceKind = pointerKindMouse;
+        break;
+      case PointerDeviceKind.touch:
+        deviceKind = pointerKindTouch;
+        break;
+      default:
+        deviceKind = pointerKindUnknown;
+        break;
+    }
+
+    final int eventType;
+    Offset scrollAmount = Offset.zero;
+    if (event is PointerDownEvent) {
+      eventType = pointerDownEvent;
+    } else if (event is PointerUpEvent) {
+      eventType = pointerUpEvent;
+    } else if (event is PointerHoverEvent) {
+      eventType = pointerHoverEvent;
+    } else if (event is PointerMoveEvent) {
+      eventType = pointerMoveEvent;
+    } else if (event is PointerEnterEvent) {
+      eventType = pointerEnterEvent;
+    } else if (event is PointerExitEvent) {
+      eventType = pointerExitEvent;
+    } else if (event is PointerScrollEvent) {
+      eventType = pointerScrollEvent;
+      scrollAmount = event.scrollDelta;
+    } else {
+      eventType = pointerUnknownEvent;
+    }
+
+    // Apply coordinate transformation if provided, otherwise pass through
+    final localPos = coordTransform != null
+        ? coordTransform(event.localPosition)
+        : event.localPosition;
+
+    return [
+      handle,
+      event.buttons,
+      event.delta.dx,
+      event.delta.dy,
+      event.device,
+      event.distance,
+      event.down,
+      event.embedderId,
+      deviceKind,
+      event.localDelta.dx,
+      event.localDelta.dy,
+      localPos.dx,
+      localPos.dy,
+      event.obscured,
+      event.orientation,
+      event.platformData,
+      event.pointer,
+      event.position.dx,
+      event.position.dy,
+      event.pressure,
+      event.radiusMajor,
+      event.radiusMinor,
+      event.size,
+      event.synthesized,
+      event.tilt,
+      event.timeStamp.inMicroseconds,
+      eventType,
+      widgetSize.width,
+      widgetSize.height,
+      scrollAmount.dx,
+      scrollAmount.dy,
+    ];
+  }
+}
+
 class SurfaceView extends StatefulWidget {
   final Surface surface;
 
@@ -171,24 +257,52 @@ class _SurfaceViewState extends State<SurfaceView> {
   }
 }
 
-/// Widget for rendering popup surfaces (menus, dropdowns)
-/// Input is handled directly by wlroots via cursor hit testing, not Flutter
-class PopupView extends StatelessWidget {
+/// Widget for rendering popup surfaces (menus, dropdowns, tooltips).
+/// Handles input through Flutter and forwards to wlroots via platform channel.
+class PopupView extends StatefulWidget {
   final Popup popup;
 
   const PopupView({Key? key, required this.popup}) : super(key: key);
 
   @override
+  State<PopupView> createState() => _PopupViewState();
+}
+
+class _PopupViewState extends State<PopupView> {
+  late _PopupPlatformViewController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = _PopupPlatformViewController(popup: widget.popup);
+  }
+
+  @override
+  void didUpdateWidget(PopupView oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.popup != widget.popup) {
+      _controller = _PopupPlatformViewController(popup: widget.popup);
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
-    // IgnorePointer ensures Flutter doesn't intercept pointer events
-    // wlroots handles popup input directly via cursor motion/button handlers
-    return IgnorePointer(
-      child: Texture(textureId: popup.textureId),
+    // Use Listener to capture all pointer events and forward to wlroots
+    // This maintains Flutter-first architecture while enabling popup input
+    return Listener(
+      onPointerDown: _controller.dispatchPointerEvent,
+      onPointerMove: _controller.dispatchPointerEvent,
+      onPointerUp: _controller.dispatchPointerEvent,
+      onPointerHover: _controller.dispatchPointerEvent,
+      onPointerCancel: _controller.dispatchPointerEvent,
+      onPointerSignal: _controller.dispatchPointerEvent,
+      behavior: HitTestBehavior.opaque,
+      child: Texture(textureId: widget.popup.textureId),
     );
   }
 }
 
-class _CompositorPlatformViewController extends PlatformViewController {
+class _CompositorPlatformViewController extends PlatformViewController with _PointerEventEncoder {
   Surface surface;
   Size size = const Size(100, 100);
 
@@ -199,91 +313,16 @@ class _CompositorPlatformViewController extends PlatformViewController {
     Compositor.compositor.platform.surfaceToplevelSetSize(surface, size.width.round(), size.height.round());
   }
 
-  /// Transform widget-relative coordinates to surface coordinates.
-  /// Simple pass-through - let wlroots handle coordinate mapping.
-  Offset _toSurfaceCoords(Offset widgetPos) {
-    return widgetPos;
-  }
-
   @override
   Future<void> clearFocus() => Compositor.compositor.platform.clearFocus(surface);
 
   @override
   Future<void> dispatchPointerEvent(PointerEvent event) async {
-    //print("${event.toString()}");
-
-    final int deviceKind;
-    switch (event.kind) {
-      case PointerDeviceKind.mouse:
-        deviceKind = pointerKindMouse;
-        break;
-      case PointerDeviceKind.touch:
-        deviceKind = pointerKindTouch;
-        break;
-      default:
-        deviceKind = pointerKindUnknown;
-        break;
-    }
-
-    final int eventType;
-    Offset scrollAmount = Offset.zero;
-    if (event is PointerDownEvent) {
-      eventType = pointerDownEvent;
-    } else if (event is PointerUpEvent) {
-      eventType = pointerUpEvent;
-    } else if (event is PointerHoverEvent) {
-      eventType = pointerHoverEvent;
-    } else if (event is PointerMoveEvent) {
-      eventType = pointerMoveEvent;
-    } else if (event is PointerEnterEvent) {
-      eventType = pointerEnterEvent;
-    } else if (event is PointerExitEvent) {
-      eventType = pointerExitEvent;
-    } else if (event is PointerScrollEvent) {
-      eventType = pointerScrollEvent;
-      scrollAmount = event.scrollDelta;
-    } else {
-      eventType = pointerUnknownEvent;
-    }
-
-    // Simple coordinate pass-through
-    final surfacePos = _toSurfaceCoords(event.localPosition);
-
-    List data = [
-      surface.handle,
-      event.buttons,
-      event.delta.dx,
-      event.delta.dy,
-      event.device,
-      event.distance,
-      event.down,
-      event.embedderId,
-      deviceKind,
-      event.localDelta.dx,
-      event.localDelta.dy,
-      surfacePos.dx,
-      surfacePos.dy,
-      event.obscured,
-      event.orientation,
-      event.platformData,
-      event.pointer,
-      event.position.dx,
-      event.position.dy,
-      event.pressure,
-      event.radiusMajor,
-      event.radiusMinor,
-      event.size,
-      event.synthesized,
-      event.tilt,
-      event.timeStamp.inMicroseconds,
-      eventType,
-      size.width,
-      size.height,
-      scrollAmount.dx,
-      scrollAmount.dy,
-    ];
-
-    //print("pointerevent $data");
+    final data = encodePointerEvent(
+      handle: surface.handle,
+      event: event,
+      widgetSize: size,
+    );
 
     await Compositor.compositor.platform.channel.invokeMethod(
       "surface_pointer_event",
@@ -294,9 +333,36 @@ class _CompositorPlatformViewController extends PlatformViewController {
   @override
   Future<void> dispose() async {
     // TODO: implement dispose
-    //throw UnimplementedError();
   }
 
   @override
   int get viewId => surface.handle;
+}
+
+/// Controller for dispatching pointer events from PopupView to wlroots.
+/// Follows the same pattern as _CompositorPlatformViewController but uses
+/// popup_pointer_event channel method.
+class _PopupPlatformViewController with _PointerEventEncoder {
+  final Popup popup;
+
+  _PopupPlatformViewController({required this.popup});
+
+  /// Get the popup size for coordinate calculations
+  Size get size => Size(
+    popup.width > 0 ? popup.width.toDouble() : 100,
+    popup.height > 0 ? popup.height.toDouble() : 100,
+  );
+
+  Future<void> dispatchPointerEvent(PointerEvent event) async {
+    final data = encodePointerEvent(
+      handle: popup.handle,
+      event: event,
+      widgetSize: size,
+    );
+
+    await Compositor.compositor.platform.channel.invokeMethod(
+      "popup_pointer_event",
+      data,
+    );
+  }
 }
