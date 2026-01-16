@@ -78,119 +78,6 @@ static void send_flutter_mouse_event(struct fwr_instance *instance,
   instance->fl_proc_table.SendPointerEvent(instance->engine, &pointer_event, 1);
 }
 
-struct hit_test_result {
-  struct wlr_scene_node *node;
-  struct wlr_surface *surface;
-  struct fwr_view *view;
-  struct fwr_popup *popup;  // Non-null if cursor is over a popup
-  bool is_decoration;
-  bool is_flutter;
-  double nx;
-  double ny;
-};
-
-// Hit test using wlroots scene graph
-// Popups are now in the scene graph, so wlr_scene_node_at handles them automatically
-static struct hit_test_result hit_test_cursor(struct fwr_instance *instance) {
-  struct hit_test_result res = {0};
-  res.surface = NULL;
-  res.view = NULL;
-  res.popup = NULL;
-  res.is_decoration = false;
-  res.is_flutter = false;
-
-  if (instance->scene == NULL) {
-    return res;
-  }
-
-  double nx = 0.0;
-  double ny = 0.0;
-  struct wlr_scene_node *node = wlr_scene_node_at(&instance->scene->tree.node,
-      instance->cursor->x, instance->cursor->y, &nx, &ny);
-  res.node = node;
-  res.nx = nx;
-  res.ny = ny;
-
-  if (node == NULL) {
-    // No scene node hit - this means we're over the Flutter shell background
-    // Flutter renders everything, so if no Wayland surface is hit, Flutter gets the event
-    res.is_flutter = true;
-    return res;
-  }
-
-  if (node->type == WLR_SCENE_NODE_RECT) {
-    res.is_decoration = true;
-    res.is_flutter = true;
-    res.view = node->data;
-    return res;
-  }
-
-  if (node->type != WLR_SCENE_NODE_BUFFER) {
-    return res;
-  }
-
-  struct wlr_scene_buffer *scene_buffer = wlr_scene_buffer_from_node(node);
-  struct wlr_scene_surface *scene_surface = wlr_scene_surface_try_from_buffer(scene_buffer);
-  if (scene_surface == NULL) {
-    if (node->data == instance) {
-      res.is_flutter = true;
-    }
-    return res;
-  }
-
-  res.surface = scene_surface->surface;
-
-  // Check if there's a subsurface at this position
-  // wlr_surface_surface_at() traverses the surface tree including subsurfaces
-  double sub_x, sub_y;
-  struct wlr_surface *leaf_surface = wlr_surface_surface_at(
-      res.surface, res.nx, res.ny, &sub_x, &sub_y);
-  if (leaf_surface != NULL) {
-    res.surface = leaf_surface;
-    res.nx = sub_x;
-    res.ny = sub_y;
-  }
-
-  // Try to find the view or popup from the xdg_surface
-  struct wlr_xdg_surface *xdg_surface = wlr_xdg_surface_try_from_wlr_surface(scene_surface->surface);
-  if (xdg_surface != NULL) {
-    if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_POPUP) {
-      // This is a popup - xdg_surface->data contains fwr_popup
-      res.popup = xdg_surface->data;
-      if (res.popup != NULL) {
-        res.view = res.popup->parent_view;
-      }
-    } else if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_TOPLEVEL) {
-      // This is a toplevel - xdg_surface->data contains fwr_view
-      res.view = xdg_surface->data;
-    }
-  }
-
-  // Check if cursor is actually within the view's visual bounds (where Flutter renders it)
-  // The scene graph may extend beyond the visible window area, so verify the cursor
-  // is within the view's rendered rectangle before routing input to the surface
-  if (res.view != NULL && res.popup == NULL) {
-    int titlebar_height = res.view->uses_ssd ? 38 : 0;
-    int view_x = res.view->x;
-    int view_y = res.view->y;
-    int view_width = res.view->width;
-    int view_height = res.view->height + titlebar_height;
-
-    double cx = instance->cursor->x;
-    double cy = instance->cursor->y;
-
-    // If cursor is outside the view's visual bounds, this is Flutter UI space
-    if (cx < view_x || cx >= view_x + view_width ||
-        cy < view_y || cy >= view_y + view_height) {
-      res.is_flutter = true;
-      res.surface = NULL;
-      res.view = NULL;
-    }
-  }
-
-  return res;
-}
-
 static void send_surface_position(struct fwr_instance *instance, struct fwr_view *view);
 static void send_grab_end(struct fwr_instance *instance, struct fwr_view *view);
 
@@ -395,7 +282,12 @@ static void on_server_cursor_touch_down(struct wl_listener *listener, void *data
   struct wlr_touch_down_event *event = data;
   struct fwr_input_device_state *state = event->touch->base.data;
 
-  if (event->touch_id >= 10) return;
+  // Guard against touch events before Flutter engine is initialized
+  if (instance->engine == NULL) {
+    return;
+  }
+
+  if (event->touch_id >= FWR_MULTITOUCH_MAX) return;
   state->touch_points[event->touch_id].x = event->x;
   state->touch_points[event->touch_id].y = event->y;
 
@@ -430,7 +322,12 @@ static void on_server_cursor_touch_up(struct wl_listener *listener, void *data) 
   struct wlr_touch_up_event *event = data;
   struct fwr_input_device_state *state = event->touch->base.data;
 
-  if (event->touch_id >= 10) return;
+  // Guard against touch events before Flutter engine is initialized
+  if (instance->engine == NULL) {
+    return;
+  }
+
+  if (event->touch_id >= FWR_MULTITOUCH_MAX) return;
 
   double screen_width = 1.0;
   double screen_height = 1.0;
@@ -461,7 +358,12 @@ static void on_server_cursor_touch_motion(struct wl_listener *listener, void *da
   struct wlr_touch_motion_event *event = data;
   struct fwr_input_device_state *state = event->touch->base.data;
 
-  if (event->touch_id >= 10) return;
+  // Guard against touch events before Flutter engine is initialized
+  if (instance->engine == NULL) {
+    return;
+  }
+
+  if (event->touch_id >= FWR_MULTITOUCH_MAX) return;
   state->touch_points[event->touch_id].x = event->x;
   state->touch_points[event->touch_id].y = event->y;
 
@@ -608,6 +510,10 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
       struct fwr_instance *instance = keyboard->instance;
       struct fwr_view *focused = get_focused_view(instance);
       if (focused == NULL) {
+        // Guard against empty views_list - wl_container_of would compute garbage pointer
+        if (wl_list_empty(&instance->views_list)) {
+          return;
+        }
         struct fwr_view *first = wl_container_of(instance->views_list.next, first, link);
         if (first->scene_tree != NULL && first->scene_tree->node.enabled) {
           focus_view_and_raise(first);
@@ -884,15 +790,19 @@ static int64_t get_surface_buttons(uint32_t surface_handle) {
   return 0;
 }
 
+#define SURFACE_BUTTON_STATES_SIZE 32
+
 static void set_surface_buttons(uint32_t surface_handle, int64_t buttons) {
-  for (size_t i = 0; i < sizeof(surface_button_states) / sizeof(surface_button_states[0]); i++) {
+  // First, try to find existing entry for this surface
+  for (size_t i = 0; i < SURFACE_BUTTON_STATES_SIZE; i++) {
     if (surface_button_states[i].active && surface_button_states[i].surface_handle == surface_handle) {
       surface_button_states[i].buttons = buttons;
       return;
     }
   }
 
-  for (size_t i = 0; i < sizeof(surface_button_states) / sizeof(surface_button_states[0]); i++) {
+  // No existing entry, find an empty slot
+  for (size_t i = 0; i < SURFACE_BUTTON_STATES_SIZE; i++) {
     if (!surface_button_states[i].active) {
       surface_button_states[i].active = true;
       surface_button_states[i].surface_handle = surface_handle;
@@ -900,10 +810,15 @@ static void set_surface_buttons(uint32_t surface_handle, int64_t buttons) {
       return;
     }
   }
+
+  // Array full - this indicates a leak (surfaces destroyed without calling fwr_clear_surface_buttons)
+  wlr_log(WLR_ERROR, "surface_button_states array full (%d entries) - button tracking may be incorrect. "
+          "Ensure fwr_clear_surface_buttons() is called when surfaces are destroyed.",
+          SURFACE_BUTTON_STATES_SIZE);
 }
 
-static void clear_surface_buttons(uint32_t surface_handle) {
-  for (size_t i = 0; i < sizeof(surface_button_states) / sizeof(surface_button_states[0]); i++) {
+void fwr_clear_surface_buttons(uint32_t surface_handle) {
+  for (size_t i = 0; i < SURFACE_BUTTON_STATES_SIZE; i++) {
     if (surface_button_states[i].active && surface_button_states[i].surface_handle == surface_handle) {
       surface_button_states[i].active = false;
       surface_button_states[i].surface_handle = 0;

@@ -412,6 +412,10 @@ void fwr_renderer_init(struct fwr_instance *instance, gl_resolve_fn resolver) {
     wlr_log(WLR_ERROR, "Could not init render mutex");
   }
 
+  if (pthread_mutex_init(&renderer->texture_mutex, NULL) != 0) {
+    wlr_log(WLR_ERROR, "Could not init texture mutex");
+  }
+
   eglMakeCurrent(instance->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, instance->fwr_renderer.flutter_egl_context);
 
   renderer->quad_rgbx_shader = make_quad_rgbx_shader(instance);
@@ -995,6 +999,14 @@ static void render_scene_layer_platform(struct fwr_instance *instance, struct wl
 
 void fwr_cached_texture_destroy(struct fwr_instance *instance,
                                 struct fwr_cached_texture *cache) {
+  struct fwr_renderer *renderer = &instance->fwr_renderer;
+
+  // Take texture mutex to prevent race with Flutter render thread
+  pthread_mutex_lock(&renderer->texture_mutex);
+
+  // Mark as destroyed first - this allows early detection of use-after-destroy
+  cache->destroyed = true;
+
   // Check if there's anything to clean up
   bool has_egl_images = false;
   for (int i = 0; i < FWR_EGLIMAGE_CACHE_SIZE; i++) {
@@ -1005,6 +1017,7 @@ void fwr_cached_texture_destroy(struct fwr_instance *instance,
   }
 
   if (cache->tex == 0 && cache->fbo == 0 && !has_egl_images) {
+    pthread_mutex_unlock(&renderer->texture_mutex);
     return;
   }
 
@@ -1014,11 +1027,13 @@ void fwr_cached_texture_destroy(struct fwr_instance *instance,
   EGLSurface prev_draw = eglGetCurrentSurface(EGL_DRAW);
   EGLSurface prev_read = eglGetCurrentSurface(EGL_READ);
 
-  if (!eglMakeCurrent(instance->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
-                      instance->egl_context)) {
-    wlr_log(WLR_ERROR, "Failed to bind EGL context for texture cleanup");
+  bool context_bound = eglMakeCurrent(instance->egl_display, EGL_NO_SURFACE,
+                                       EGL_NO_SURFACE, instance->egl_context);
+  if (!context_bound) {
+    wlr_log(WLR_ERROR, "Failed to bind EGL context for texture cleanup (error=0x%x)",
+            eglGetError());
+    // Even on failure, we must zero the cache to prevent double-free attempts
   } else {
-    struct fwr_renderer *renderer = &instance->fwr_renderer;
     struct gl_fns *fns = &renderer->fns;
 
     if (cache->tex != 0) {
@@ -1040,10 +1055,10 @@ void fwr_cached_texture_destroy(struct fwr_instance *instance,
         }
       }
     }
-
-    eglMakeCurrent(instance->egl_display, prev_draw, prev_read, prev_ctx);
   }
 
+  // Always zero the cache state regardless of context bind success
+  // This prevents use-after-free and double-free
   cache->tex = 0;
   cache->fbo = 0;
   cache->current_egl_image = NULL;
@@ -1053,6 +1068,13 @@ void fwr_cached_texture_destroy(struct fwr_instance *instance,
   cache->last_seq = 0;
   cache->is_external = false;
   cache->tex_params_set = false;
+
+  // Only restore context if we successfully bound it
+  if (context_bound) {
+    eglMakeCurrent(instance->egl_display, prev_draw, prev_read, prev_ctx);
+  }
+
+  pthread_mutex_unlock(&renderer->texture_mutex);
 }
 
 GLuint fwr_renderer_copy_texture(struct fwr_instance *instance,
@@ -1061,6 +1083,12 @@ GLuint fwr_renderer_copy_texture(struct fwr_instance *instance,
                                  struct fwr_cached_texture *cache) {
   if (eglGetCurrentContext() == EGL_NO_CONTEXT) {
     wlr_log(WLR_ERROR, "No current EGL context in copy_texture!");
+    return 0;
+  }
+
+  // Check for destroyed cache (race condition detection)
+  if (cache->destroyed) {
+    wlr_log(WLR_ERROR, "Attempted to use destroyed texture cache");
     return 0;
   }
 
@@ -1082,6 +1110,9 @@ GLuint fwr_renderer_copy_texture(struct fwr_instance *instance,
 
   GLint old_array_buffer;
   fns->glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &old_array_buffer);
+
+  GLint old_tex_2d;
+  fns->glGetIntegerv(GL_TEXTURE_BINDING_2D, &old_tex_2d);
 
   GLboolean blend_enabled = fns->glIsEnabled(GL_BLEND);
   GLboolean scissor_enabled = fns->glIsEnabled(GL_SCISSOR_TEST);
@@ -1109,6 +1140,19 @@ GLuint fwr_renderer_copy_texture(struct fwr_instance *instance,
   // Only reallocate texture storage if size changed
   if (need_alloc) {
     fns->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+
+    // Check for GL_OUT_OF_MEMORY or other errors
+    GLenum tex_err = fns->glGetError();
+    if (tex_err != GL_NO_ERROR) {
+      wlr_log(WLR_ERROR, "glTexImage2D failed with error 0x%x (dimensions: %dx%d)", tex_err, width, height);
+      // Clean up the texture we just created
+      fns->glBindTexture(GL_TEXTURE_2D, old_tex_2d);
+      fns->glDeleteTextures(1, &cache->tex);
+      cache->tex = 0;
+      cache->width = 0;
+      cache->height = 0;
+      return 0;
+    }
     cache->width = width;
     cache->height = height;
   }
@@ -1116,6 +1160,12 @@ GLuint fwr_renderer_copy_texture(struct fwr_instance *instance,
   // Create FBO if needed
   if (cache->fbo == 0) {
     fns->glGenFramebuffers(1, &cache->fbo);
+    if (cache->fbo == 0) {
+      wlr_log(WLR_ERROR, "glGenFramebuffers failed");
+      // Don't delete the texture - it might be reusable for a later attempt
+      fns->glBindTexture(GL_TEXTURE_2D, old_tex_2d);
+      return 0;
+    }
   }
 
   // Bind FBO and attach texture
@@ -1124,9 +1174,17 @@ GLuint fwr_renderer_copy_texture(struct fwr_instance *instance,
 
   GLenum status = fns->glCheckFramebufferStatus(GL_FRAMEBUFFER);
   if (status != GL_FRAMEBUFFER_COMPLETE) {
-    wlr_log(WLR_ERROR, "Framebuffer incomplete: 0x%x, tex: %d, fbo: %d, ext: %d", status, cache->tex, cache->fbo, texture);
-    // Restore FBO before returning
+    wlr_log(WLR_ERROR, "Framebuffer incomplete: 0x%x, tex: %d, fbo: %d, src_tex: %d", status, cache->tex, cache->fbo, texture);
+    // Restore state and clean up resources to prevent leak
     fns->glBindFramebuffer(GL_FRAMEBUFFER, old_fbo);
+    fns->glBindTexture(GL_TEXTURE_2D, old_tex_2d);
+    // Delete both texture and FBO - they're unusable together
+    fns->glDeleteFramebuffers(1, &cache->fbo);
+    fns->glDeleteTextures(1, &cache->tex);
+    cache->fbo = 0;
+    cache->tex = 0;
+    cache->width = 0;
+    cache->height = 0;
     return 0;
   }
 
@@ -1186,8 +1244,8 @@ GLuint fwr_renderer_copy_texture(struct fwr_instance *instance,
   // Restore all GL state
   fns->glUseProgram(old_prog);
   fns->glBindFramebuffer(GL_FRAMEBUFFER, old_fbo);
-  fns->glBindTexture(target, 0);
   fns->glActiveTexture(old_active_texture);
+  fns->glBindTexture(GL_TEXTURE_2D, old_tex_2d);  // Restore original texture binding
   fns->glBindBuffer(GL_ARRAY_BUFFER, old_array_buffer);
   fns->glViewport(old_viewport[0], old_viewport[1], old_viewport[2], old_viewport[3]);
 
@@ -1211,6 +1269,13 @@ static void *get_or_create_egl_image(struct fwr_instance *instance,
   struct fwr_renderer *renderer = &instance->fwr_renderer;
   int target_width = dmabuf_attribs->width;
   int target_height = dmabuf_attribs->height;
+
+  // Validate plane count (defensive check - wlroots guarantees max 4 planes)
+  if (dmabuf_attribs->n_planes <= 0 || dmabuf_attribs->n_planes > WLR_DMABUF_MAX_PLANES) {
+    wlr_log(WLR_ERROR, "Invalid DMA-BUF plane count: %d (max: %d)",
+            dmabuf_attribs->n_planes, WLR_DMABUF_MAX_PLANES);
+    return NULL;
+  }
 
   // Check if we already have an EGLImage for this buffer with matching dimensions
   for (int i = 0; i < FWR_EGLIMAGE_CACHE_SIZE; i++) {
@@ -1333,6 +1398,11 @@ bool fwr_renderer_import_surface_dmabuf(struct fwr_instance *instance,
     return false;
   }
 
+  // Early check for destroyed cache (race condition detection)
+  if (cache->destroyed) {
+    return false;
+  }
+
   // Get the client buffer from the surface
   struct wlr_client_buffer *client_buffer = surface->buffer;
   if (client_buffer == NULL || client_buffer->source == NULL) {
@@ -1348,12 +1418,22 @@ bool fwr_renderer_import_surface_dmabuf(struct fwr_instance *instance,
     return false;
   }
 
+  // Take texture mutex to synchronize with texture destruction
+  pthread_mutex_lock(&renderer->texture_mutex);
+
+  // Double-check destroyed flag after acquiring lock (prevents TOCTOU race)
+  if (cache->destroyed) {
+    pthread_mutex_unlock(&renderer->texture_mutex);
+    return false;
+  }
+
   // Check if we can reuse the existing texture (same sequence = same content)
   uint32_t current_seq = surface->current.seq;
   if (cache->tex != 0 && cache->last_seq == current_seq &&
       cache->width == dmabuf_attribs.width &&
       cache->height == dmabuf_attribs.height) {
     // Content unchanged - reuse existing texture
+    pthread_mutex_unlock(&renderer->texture_mutex);
     return true;
   }
 
@@ -1362,6 +1442,7 @@ bool fwr_renderer_import_surface_dmabuf(struct fwr_instance *instance,
   if (egl_image == NULL) {
     wlr_log(WLR_DEBUG, "Failed to create EGLImage from DMA-BUF (format=0x%x, mod=0x%lx)",
             dmabuf_attribs.format, dmabuf_attribs.modifier);
+    pthread_mutex_unlock(&renderer->texture_mutex);
     return false;
   }
 
@@ -1373,6 +1454,11 @@ bool fwr_renderer_import_surface_dmabuf(struct fwr_instance *instance,
   struct gl_fns *fns = &renderer->fns;
   if (cache->tex == 0) {
     fns->glGenTextures(1, &cache->tex);
+    if (cache->tex == 0) {
+      wlr_log(WLR_ERROR, "glGenTextures failed in dmabuf import");
+      pthread_mutex_unlock(&renderer->texture_mutex);
+      return false;
+    }
   }
 
   // For DMA-BUF imports, we typically need GL_TEXTURE_EXTERNAL_OES
@@ -1401,6 +1487,7 @@ bool fwr_renderer_import_surface_dmabuf(struct fwr_instance *instance,
   cache->height = dmabuf_attribs.height;
   cache->last_seq = current_seq;
 
+  pthread_mutex_unlock(&renderer->texture_mutex);
   return true;
 }
 

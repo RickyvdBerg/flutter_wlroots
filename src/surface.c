@@ -460,6 +460,9 @@ static void xdg_toplevel_destroy(struct wl_listener *listener, void *data) {
   // Delete GL resources
   fwr_cached_texture_destroy(instance, &view->cache);
 
+  // Clear button state tracking for this surface
+  fwr_clear_surface_buttons(view->handle);
+
   view_destroy_scene(view);
 
   handle_map_remove(instance->views, view->handle);
@@ -1288,6 +1291,9 @@ static void popup_handle_destroy(struct wl_listener *listener, void *data) {
 
   // Clean up cached GL resources
   fwr_cached_texture_destroy(instance, &popup->cache);
+
+  // Clear button state tracking for this popup (uses +200000 offset)
+  fwr_clear_surface_buttons(popup->handle + 200000);
 
   wl_list_remove(&popup->map.link);
   wl_list_remove(&popup->unmap.link);

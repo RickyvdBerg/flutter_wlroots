@@ -69,3 +69,6 @@ void fwr_handle_surface_begin_move(struct fwr_instance *instance, const FlutterP
 void fwr_handle_surface_begin_resize(struct fwr_instance *instance, const FlutterPlatformMessageResponseHandle *handle, struct dart_value *args);
 
 void fwr_handle_popup_pointer_event_message(struct fwr_instance *instance, const FlutterPlatformMessageResponseHandle *handle, struct dart_value *args);
+
+// Clear button state tracking for a surface (call when surface is destroyed)
+void fwr_clear_surface_buttons(uint32_t surface_handle);

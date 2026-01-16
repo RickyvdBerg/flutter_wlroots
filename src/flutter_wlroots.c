@@ -214,6 +214,12 @@ static bool provide_surface_texture(struct fwr_instance *instance,
 #define GL_TEXTURE_EXTERNAL_OES 0x8D65
 #endif
 
+  // Check for destroyed cache (race condition protection)
+  if (cache->destroyed) {
+    wlr_log(WLR_DEBUG, "Texture request for destroyed cache - surface likely being torn down");
+    return false;
+  }
+
   // Try DMA-BUF zero-copy import first (preferred path)
   if (fwr_renderer_import_surface_dmabuf(instance, surface, cache)) {
     texture_out->target = cache->is_external ? GL_TEXTURE_EXTERNAL_OES : GL_TEXTURE_2D;
@@ -227,6 +233,33 @@ static bool provide_surface_texture(struct fwr_instance *instance,
   }
 
   // Fall back to texture copy path
+  // Clean up any orphaned EGLImages from previous DMA-BUF path
+  // (happens when surface switches from DMA-BUF to SHM buffer)
+  if (cache->current_egl_image != NULL) {
+    struct fwr_renderer *renderer = &instance->fwr_renderer;
+    pthread_mutex_lock(&renderer->texture_mutex);
+    if (renderer->eglDestroyImageKHR) {
+      for (int i = 0; i < FWR_EGLIMAGE_CACHE_SIZE; i++) {
+        if (cache->egl_cache[i].egl_image != NULL) {
+          renderer->eglDestroyImageKHR(instance->egl_display, cache->egl_cache[i].egl_image);
+          cache->egl_cache[i].egl_image = NULL;
+          cache->egl_cache[i].buffer = NULL;
+          cache->egl_cache[i].width = 0;
+          cache->egl_cache[i].height = 0;
+        }
+      }
+    }
+    cache->current_egl_image = NULL;
+    cache->egl_cache_next = 0;
+    // Reset texture state since we're switching paths - texture needs reallocation
+    if (cache->tex != 0) {
+      renderer->fns.glDeleteTextures(1, &cache->tex);
+      cache->tex = 0;
+    }
+    cache->is_external = false;
+    cache->tex_params_set = false;
+    pthread_mutex_unlock(&renderer->texture_mutex);
+  }
   struct wlr_texture *wlr_tex = wlr_surface_get_texture(surface);
   if (wlr_tex == NULL) {
     return false;

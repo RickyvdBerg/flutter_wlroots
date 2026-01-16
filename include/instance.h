@@ -42,6 +42,7 @@ struct fwr_cached_texture {
   uint32_t last_seq;    // Surface commit sequence - skip reimport if unchanged
   bool is_external;     // True if texture requires GL_TEXTURE_EXTERNAL_OES
   bool tex_params_set;  // True if texture parameters have been configured
+  bool destroyed;       // True if texture has been destroyed (for race detection)
 
   // EGLImage cache for triple-buffering (avoids recreating EGLImage every frame)
   struct fwr_eglimage_cache_entry egl_cache[FWR_EGLIMAGE_CACHE_SIZE];

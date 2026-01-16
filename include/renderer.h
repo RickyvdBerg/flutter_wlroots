@@ -162,6 +162,7 @@ struct fwr_renderer {
   bool has_dmabuf_import;
 
   pthread_mutex_t render_mutex;
+  pthread_mutex_t texture_mutex;  // Protects texture operations across threads
 };
 
 typedef void (*gl_resolved_fn)();
