@@ -9,6 +9,11 @@ struct handle_map {
     std::map<uint32_t, void*> map;
 };
 
+struct handle_map_iter {
+    handle_map *map;
+    std::map<uint32_t, void*>::iterator it;
+};
+
 extern "C" handle_map *handle_map_new() {
     handle_map *map = new handle_map({1, {}});
     return map;
@@ -42,4 +47,29 @@ extern "C" bool handle_map_get(handle_map *map, uint32_t handle, void **out) {
         *out = entry->second;
         return true;
     }
+}
+
+extern "C" handle_map_iter *handle_map_iter_new(handle_map *map) {
+    handle_map_iter *iter = new handle_map_iter();
+    iter->map = map;
+    iter->it = map->map.begin();
+    return iter;
+}
+
+extern "C" void handle_map_iter_destroy(handle_map_iter *iter) {
+    delete iter;
+}
+
+extern "C" bool handle_map_iter_next(handle_map_iter *iter, uint32_t *handle_out, void **value_out) {
+    if (iter->it == iter->map->map.end()) {
+        return false;
+    }
+    if (handle_out != NULL) {
+        *handle_out = iter->it->first;
+    }
+    if (value_out != NULL) {
+        *value_out = iter->it->second;
+    }
+    ++iter->it;
+    return true;
 }

@@ -171,4 +171,5 @@ void fwr_renderer_update_scene_positions(struct fwr_instance *instance);
 GLuint fwr_renderer_copy_texture(struct fwr_instance *instance,
                                  GLuint texture, GLenum target,
                                  int width, int height,
-                                 GLuint *cached_tex, GLuint *cached_fbo);
+                                 GLuint *cached_tex, GLuint *cached_fbo,
+                                 int *cached_width, int *cached_height);

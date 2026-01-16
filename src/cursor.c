@@ -79,9 +79,17 @@ static bool cursor_handle_message(struct fwr_instance *instance,
       if (kind_value != NULL && kind_value->type == kStdString) {
         const char *flutter_kind = kind_value->string_value;
         const char *xcursor_name = flutter_cursor_to_xcursor(flutter_kind);
-        
+
         if (xcursor_name != NULL) {
           wlr_log(WLR_DEBUG, "Setting cursor: flutter=%s xcursor=%s", flutter_kind, xcursor_name);
+
+          // Store current xcursor name for software rendering
+          free(instance->current_xcursor_name);
+          instance->current_xcursor_name = strdup(xcursor_name);
+
+          // Clear client cursor surface when using xcursor
+          instance->client_cursor_surface = NULL;
+
           wlr_cursor_set_xcursor(instance->cursor, instance->cursor_mgr, xcursor_name);
         }
       }

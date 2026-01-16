@@ -28,15 +28,25 @@
 #include <wlr/render/allocator.h>
 #include <wlr/types/wlr_compositor.h>
 #include <wlr/types/wlr_data_device.h>
+#include <wlr/types/wlr_subcompositor.h>
 #include <wlr/types/wlr_output_layout.h>
 #include <wlr/types/wlr_scene.h>
 #include <wlr/types/wlr_xdg_shell.h>
 #include <wlr/types/wlr_xdg_decoration_v1.h>
+#include <wlr/types/wlr_server_decoration.h>
 #include <wlr/types/wlr_cursor.h>
 #include <wlr/types/wlr_xcursor_manager.h>
 #include <wlr/types/wlr_matrix.h>
 #include <wlr/types/wlr_presentation_time.h>
 #include <wlr/types/wlr_seat.h>
+#include <wlr/util/edges.h>
+#include <wlr/types/wlr_primary_selection_v1.h>
+#include <wlr/types/wlr_idle_notify_v1.h>
+#include <wlr/types/wlr_idle_inhibit_v1.h>
+#include <wlr/types/wlr_screencopy_v1.h>
+#include <wlr/types/wlr_xdg_output_v1.h>
+#include <wlr/types/wlr_export_dmabuf_v1.h>
+#include <wlr/types/wlr_data_control_v1.h>
 
 #include "wlroots_hacks.h"
 
@@ -62,17 +72,107 @@
   }\
 } while (0)
 
+// Handler for decoration mode request - client wants to change decoration mode
+static void handle_decoration_request_mode(struct wl_listener *listener, void *data) {
+  struct fwr_view *view =
+      wl_container_of(listener, view, decoration_request_mode);
+
+  wlr_log(WLR_INFO, "=== DECORATION MODE REQUEST from client (requested=%d) ===",
+          view->decoration->requested_mode);
+
+  // Always enforce server-side decorations regardless of what client wants
+  wlr_xdg_toplevel_decoration_v1_set_mode(view->decoration,
+      WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+
+  wlr_log(WLR_INFO, "Enforced SSD mode for view %d", view->handle);
+}
+
+// Handler for decoration destroy - clean up when decoration is destroyed
+static void handle_decoration_destroy(struct wl_listener *listener, void *data) {
+  struct fwr_view *view =
+      wl_container_of(listener, view, decoration_destroy);
+
+  wlr_log(WLR_INFO, "Decoration destroyed for view %d", view->handle);
+
+  wl_list_remove(&view->decoration_request_mode.link);
+  wl_list_remove(&view->decoration_destroy.link);
+  view->decoration = NULL;
+}
+
 // Handler for new xdg-decoration requests - tell apps to use server-side decorations
 static void handle_new_toplevel_decoration(struct wl_listener *listener, void *data) {
   struct fwr_instance *instance =
       wl_container_of(listener, instance, new_toplevel_decoration);
   struct wlr_xdg_toplevel_decoration_v1 *decoration = data;
-  
+
+  wlr_log(WLR_INFO, "=== XDG DECORATION REQUEST from client ===");
+
+  // Find the view that owns this toplevel
+  struct fwr_view *view = NULL;
+  struct fwr_view *v;
+  wl_list_for_each(v, &instance->views_list, link) {
+    if (v->toplevel == decoration->toplevel) {
+      view = v;
+      break;
+    }
+  }
+
+  if (view != NULL) {
+    view->decoration = decoration;
+    view->uses_ssd = true;
+
+    // Listen for mode change requests and destroy
+    view->decoration_request_mode.notify = handle_decoration_request_mode;
+    wl_signal_add(&decoration->events.request_mode, &view->decoration_request_mode);
+
+    view->decoration_destroy.notify = handle_decoration_destroy;
+    wl_signal_add(&decoration->events.destroy, &view->decoration_destroy);
+
+    // Tell client its top edge is "tiled" - this signals it should NOT render
+    // rounded corners at the top (since our SSD decoration is there)
+    wlr_xdg_toplevel_set_tiled(view->toplevel, WLR_EDGE_TOP);
+
+    wlr_log(WLR_INFO, "Linked XDG decoration to view %d, enforcing SSD + tiled top", view->handle);
+
+    // Notify Flutter of decoration change (fixes timing issue where surface_map
+    // might be sent before decoration negotiation completes)
+    fwr_send_decoration_update(view);
+  }
+
   // Tell the client to use server-side decorations (we provide the title bar)
   wlr_xdg_toplevel_decoration_v1_set_mode(decoration,
       WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
-  
-  wlr_log(WLR_INFO, "Set server-side decorations for surface");
+
+  wlr_log(WLR_INFO, "Set SSD mode for surface");
+}
+
+// Handler for legacy KDE server decoration protocol (used by GTK3, Firefox, etc.)
+static void handle_new_server_decoration(struct wl_listener *listener, void *data) {
+  struct fwr_instance *instance =
+      wl_container_of(listener, instance, new_server_decoration);
+  struct wlr_server_decoration *decoration = data;
+
+  wlr_log(WLR_INFO, "=== LEGACY KDE DECORATION from client (surface=%p, mode=%d) ===",
+          decoration->surface, decoration->mode);
+
+  // The default mode is already SERVER, but let's find and mark the view
+  // The decoration->surface is the wlr_surface, we need to find the view that owns it
+  struct fwr_view *view;
+  wl_list_for_each(view, &instance->views_list, link) {
+    if (view->xdg_surface && view->xdg_surface->surface == decoration->surface) {
+      view->uses_ssd = true;
+
+      // Tell client its top edge is "tiled" - no rounded corners at top
+      wlr_xdg_toplevel_set_tiled(view->toplevel, WLR_EDGE_TOP);
+
+      wlr_log(WLR_INFO, "Linked legacy decoration to view %d, mode=%d (SERVER=2), tiled top",
+              view->handle, decoration->mode);
+
+      // Notify Flutter of decoration change
+      fwr_send_decoration_update(view);
+      break;
+    }
+  }
 }
 
 static bool engine_cb_renderer_make_current(void *user_data) {
@@ -102,68 +202,143 @@ static void* engine_cb_renderer_gl_proc_resolve(void *user_data, const char *nam
   return eglGetProcAddress(name);
 }
 
-static bool engine_cb_external_texture(void *user_data, int64_t texture_id, size_t width, size_t height, FlutterOpenGLTexture *texture_out) {
-  struct fwr_instance *instance = user_data;
-  
-  struct fwr_view *view = NULL;
-  if (!handle_map_get(instance->views, (uint32_t)texture_id, (void**)&view)) {
-    wlr_log(WLR_DEBUG, "External texture callback: view %ld not found", texture_id);
-    return false;
-  }
-  
-  if (view->xdg_surface == NULL || view->xdg_surface->surface == NULL) {
-    return false;
-  }
-  
-  struct wlr_texture *wlr_tex = wlr_surface_get_texture(view->xdg_surface->surface);
+// Helper function to provide texture for a wlr_surface
+static bool provide_surface_texture(struct fwr_instance *instance,
+                                    struct wlr_surface *surface,
+                                    GLuint *cached_tex, GLuint *cached_fbo,
+                                    int *cached_width, int *cached_height,
+                                    FlutterOpenGLTexture *texture_out) {
+  struct wlr_texture *wlr_tex = wlr_surface_get_texture(surface);
   if (wlr_tex == NULL) {
     return false;
   }
-  
+
   struct wlr_gles2_texture_attribs attribs;
   wlr_gles2_texture_get_attribs(wlr_tex, &attribs);
-  
-  wlr_log(WLR_INFO, "External texture cb: tex=%d target=0x%x width=%ld height=%ld", 
-          attribs.tex, attribs.target, width, height);
 
-  if (attribs.target != GL_TEXTURE_2D) {
-    // Convert texture if needed
-    // We assume it's external OES if not 2D, or at least we need to convert it to 2D for Flutter
-    GLuint tex_2d = fwr_renderer_copy_texture(instance, attribs.tex, attribs.target,
-                                                       view->xdg_surface->surface->current.width,
-                                                       view->xdg_surface->surface->current.height,
-                                                       &view->cached_tex, &view->cached_fbo);
+  wlr_log(WLR_DEBUG, "provide_surface_texture: surface=%dx%d, tex=%d, target=0x%x, has_alpha=%d",
+          surface->current.width, surface->current.height,
+          attribs.tex, attribs.target, attribs.has_alpha);
+
 #ifndef GL_RGBA8
 #define GL_RGBA8 0x8058
 #endif
 
-    if (tex_2d == 0) {
-      wlr_log(WLR_ERROR, "Copy failed for texture %d", attribs.tex);
-      return false;
-    }
-    texture_out->target = GL_TEXTURE_2D;
-    texture_out->name = tex_2d;
-  } else {
-    // Force copy even for 2D textures to ensure Flutter compatibility
-    GLuint tex_2d = fwr_renderer_copy_texture(instance, attribs.tex, attribs.target,
-                                                       view->xdg_surface->surface->current.width,
-                                                       view->xdg_surface->surface->current.height,
-                                                       &view->cached_tex, &view->cached_fbo);
-    if (tex_2d == 0) {
-      wlr_log(WLR_ERROR, "Copy failed for texture %d", attribs.tex);
-      return false;
-    }
-    texture_out->target = GL_TEXTURE_2D;
-    texture_out->name = tex_2d;
+  // Copy texture to ensure Flutter compatibility
+  GLuint tex_2d = fwr_renderer_copy_texture(instance, attribs.tex, attribs.target,
+                                             surface->current.width,
+                                             surface->current.height,
+                                             cached_tex, cached_fbo,
+                                             cached_width, cached_height);
+  if (tex_2d == 0) {
+    wlr_log(WLR_ERROR, "Copy failed for texture %d", attribs.tex);
+    return false;
   }
 
+  texture_out->target = GL_TEXTURE_2D;
+  texture_out->name = tex_2d;
   texture_out->format = GL_RGBA8;
   texture_out->user_data = NULL;
   texture_out->destruction_callback = NULL;
-  texture_out->width = view->xdg_surface->surface->current.width;
-  texture_out->height = view->xdg_surface->surface->current.height;
-  
+  texture_out->width = surface->current.width;
+  texture_out->height = surface->current.height;
+
   return true;
+}
+
+static bool engine_cb_external_texture(void *user_data, int64_t texture_id, size_t width, size_t height, FlutterOpenGLTexture *texture_out) {
+  struct fwr_instance *instance = user_data;
+
+  // First, try to find a view (toplevel surface)
+  struct fwr_view *view = NULL;
+  if (handle_map_get(instance->views, (uint32_t)texture_id, (void**)&view)) {
+    if (view->xdg_surface == NULL || view->xdg_surface->surface == NULL) {
+      return false;
+    }
+    // Per-frame logging - too verbose
+    // wlr_log(WLR_DEBUG, "External texture cb: view %d", view->handle);
+    return provide_surface_texture(instance, view->xdg_surface->surface,
+                                   &view->cached_tex, &view->cached_fbo,
+                                   &view->cached_tex_width, &view->cached_tex_height,
+                                   texture_out);
+  }
+
+  // If not a view, try to find a subsurface
+  // Subsurface texture IDs are offset by 100000 to avoid collision with view IDs
+  struct fwr_subsurface *sub = NULL;
+  if (texture_id >= 100000 && texture_id < 200000) {
+    uint32_t sub_handle = (uint32_t)(texture_id - 100000);
+    if (handle_map_get(instance->subsurfaces, sub_handle, (void**)&sub)) {
+      if (sub->surface == NULL) {
+        return false;
+      }
+      return provide_surface_texture(instance, sub->surface,
+                                     &sub->cached_tex, &sub->cached_fbo,
+                                     &sub->cached_tex_width, &sub->cached_tex_height,
+                                     texture_out);
+    }
+  }
+
+  // If not a subsurface, try to find a popup
+  // Popup texture IDs are offset by 200000 to avoid collision
+  struct fwr_popup *popup = NULL;
+  if (texture_id >= 200000) {
+    uint32_t popup_handle = (uint32_t)(texture_id - 200000);
+    if (handle_map_get(instance->popups, popup_handle, (void**)&popup)) {
+      if (popup->xdg_surface == NULL || popup->xdg_surface->surface == NULL) {
+        wlr_log(WLR_DEBUG, "Popup texture %ld: xdg_surface or surface is NULL", texture_id);
+        return false;
+      }
+      struct wlr_surface *surf = popup->xdg_surface->surface;
+
+      // Check for subsurfaces - Firefox/browsers render popup content to subsurfaces
+      struct wlr_subsurface *first_subsurface = NULL;
+      struct wlr_subsurface *subsurface;
+      wl_list_for_each(subsurface, &surf->current.subsurfaces_below, current.link) {
+        if (first_subsurface == NULL) first_subsurface = subsurface;
+      }
+      wl_list_for_each(subsurface, &surf->current.subsurfaces_above, current.link) {
+        if (first_subsurface == NULL) first_subsurface = subsurface;
+      }
+
+      // Use subsurface if available (Firefox renders content there)
+      struct wlr_surface *content_surface = surf;
+      if (first_subsurface != NULL && first_subsurface->surface != NULL) {
+        content_surface = first_subsurface->surface;
+        wlr_log(WLR_DEBUG, "Popup %d: using subsurface at (%d,%d) size %dx%d",
+                popup_handle,
+                first_subsurface->current.x, first_subsurface->current.y,
+                content_surface->current.width, content_surface->current.height);
+      }
+
+      struct wlr_texture *wlr_tex = wlr_surface_get_texture(content_surface);
+      wlr_log(WLR_DEBUG, "Providing popup texture %ld (handle=%d), content_surface=%dx%d, wlr_texture=%p",
+              texture_id, popup_handle,
+              content_surface->current.width, content_surface->current.height,
+              (void*)wlr_tex);
+
+      if (wlr_tex == NULL) {
+        wlr_log(WLR_ERROR, "Popup texture %ld: wlr_surface_get_texture returned NULL", texture_id);
+        return false;
+      }
+      bool result = provide_surface_texture(instance, content_surface,
+                                     &popup->cached_tex, &popup->cached_fbo,
+                                     &popup->cached_tex_width, &popup->cached_tex_height,
+                                     texture_out);
+      // Mark frame available again to ensure Flutter keeps requesting updates
+      // This ensures we catch subsurface content that arrives after initial request
+      if (result && popup->texture_registered) {
+        instance->fl_proc_table.MarkExternalTextureFrameAvailable(
+            instance->engine, popup->texture_id);
+      }
+      return result;
+    } else {
+      wlr_log(WLR_DEBUG, "Popup texture %ld: handle %d not found in map", texture_id, popup_handle);
+    }
+  }
+
+  wlr_log(WLR_DEBUG, "External texture callback: texture %ld not found", texture_id);
+  return false;
 }
 
 static uint32_t engine_cb_renderer_fbo(void *user_data, const FlutterFrameInfo *frame_info) {
@@ -256,6 +431,11 @@ static void engine_cb_platform_message(
       fwr_handle_surface_pointer_event_message(instance, engine_message->response_handle, &args);
       return;
     }
+    if (strcmp(method_name, "popup_pointer_event") == 0) {
+      wlr_log(WLR_DEBUG, "Routing popup_pointer_event message");
+      fwr_handle_popup_pointer_event_message(instance, engine_message->response_handle, &args);
+      return;
+    }
     if (strcmp(method_name, "surface_keyboard_key") == 0) {
       fwr_handle_surface_keyboard_key_message(instance, engine_message->response_handle, &args);
       return;
@@ -263,6 +443,25 @@ static void engine_cb_platform_message(
     if (strcmp(method_name, "surface_clear_focus") == 0) {
       wlr_seat_pointer_clear_focus(instance->seat);
       wlr_seat_keyboard_clear_focus(instance->seat);
+      instance->fl_proc_table.SendPlatformMessageResponse(
+          instance->engine, engine_message->response_handle,
+          method_call_null_success, sizeof(method_call_null_success));
+      return;
+    }
+
+    // Direct input mode - bypass Flutter for low-latency gaming
+    if (strcmp(method_name, "set_direct_input_mode") == 0) {
+      if (args.type == dvList && args.list.length >= 2) {
+        bool enabled = args.list.values[0].type == dvBool && args.list.values[0].boolean;
+        uint32_t surface_handle = 0;
+        if (args.list.values[1].type == dvInteger) {
+          surface_handle = (uint32_t)args.list.values[1].integer;
+        }
+        instance->direct_input_mode = enabled;
+        instance->direct_input_surface = surface_handle;
+        wlr_log(WLR_INFO, "Direct input mode: %s for surface %u",
+                enabled ? "enabled" : "disabled", surface_handle);
+      }
       instance->fl_proc_table.SendPlatformMessageResponse(
           instance->engine, engine_message->response_handle,
           method_call_null_success, sizeof(method_call_null_success));
@@ -403,12 +602,34 @@ bool fwr_instance_create(struct fwr_instance_opts opts, struct fwr_instance **in
   instance->allocator = wlr_allocator_autocreate(instance->backend, instance->renderer);
 
   wlr_compositor_create(instance->wl_display, 6, instance->renderer);
+  wlr_subcompositor_create(instance->wl_display);  // Required by Firefox and other browsers
   wlr_data_device_manager_create(instance->wl_display);
+
+  // Primary selection (middle-click paste) - essential for Linux workflow
+  wlr_primary_selection_v1_device_manager_create(instance->wl_display);
+
+  // Data control - clipboard access for wl-copy/wl-paste and some terminal emulators
+  wlr_data_control_manager_v1_create(instance->wl_display);
+
+  // Idle notification - lets apps know when user is idle (for screen lock, power management)
+  wlr_idle_notifier_v1_create(instance->wl_display);
+
+  // Idle inhibit - allows apps to prevent idle (video playback, presentations)
+  wlr_idle_inhibit_v1_create(instance->wl_display);
+
+  // Screencopy - enables screenshots (grim) and screen recording
+  wlr_screencopy_manager_v1_create(instance->wl_display);
 
   instance->output_layout = wlr_output_layout_create(instance->wl_display);
   instance->scene = wlr_scene_create();
   instance->scene_output_layout = wlr_scene_attach_output_layout(instance->scene, instance->output_layout);
   instance->flutter_scene_buffer = NULL;
+
+  // XDG output manager - provides output info to clients (needed by grim, etc.)
+  wlr_xdg_output_manager_v1_create(instance->wl_display, instance->output_layout);
+
+  // Export DMA-BUF - enables screen sharing (OBS, Discord, Zoom)
+  wlr_export_dmabuf_manager_v1_create(instance->wl_display);
 
   instance->new_output.notify = fwr_server_new_output;
   wl_signal_add(&instance->backend->events.new_output, &instance->new_output);
@@ -417,10 +638,25 @@ bool fwr_instance_create(struct fwr_instance_opts opts, struct fwr_instance **in
   instance->new_xdg_toplevel.notify = fwr_new_xdg_toplevel;
   wl_signal_add(&instance->xdg_shell->events.new_toplevel, &instance->new_xdg_toplevel);
 
+  // Handle popup surfaces (menus, dropdowns, tooltips)
+  instance->new_xdg_popup.notify = fwr_new_xdg_popup;
+  wl_signal_add(&instance->xdg_shell->events.new_popup, &instance->new_xdg_popup);
+
   // xdg-decoration: tell apps to use server-side decorations (we provide title bars)
   instance->decoration_manager = wlr_xdg_decoration_manager_v1_create(instance->wl_display);
   instance->new_toplevel_decoration.notify = handle_new_toplevel_decoration;
   wl_signal_add(&instance->decoration_manager->events.new_toplevel_decoration, &instance->new_toplevel_decoration);
+
+  // Legacy KDE server decoration protocol - set default mode to SERVER
+  // This tells older clients (GTK3, some Qt, Firefox) that we prefer server-side decorations
+  instance->legacy_decoration_manager =
+      wlr_server_decoration_manager_create(instance->wl_display);
+  wlr_server_decoration_manager_set_default_mode(instance->legacy_decoration_manager,
+      WLR_SERVER_DECORATION_MANAGER_MODE_SERVER);
+  instance->new_server_decoration.notify = handle_new_server_decoration;
+  wl_signal_add(&instance->legacy_decoration_manager->events.new_decoration,
+      &instance->new_server_decoration);
+  wlr_log(WLR_INFO, "Enabled KDE server decoration protocol with SERVER mode default");
 
   fwr_input_init(instance);
 
@@ -440,6 +676,8 @@ bool fwr_instance_create(struct fwr_instance_opts opts, struct fwr_instance **in
 	}
 
   instance->views = handle_map_new();
+  instance->subsurfaces = handle_map_new();
+  instance->popups = handle_map_new();
   wl_list_init(&instance->views_list);
 
   fwr_renderer_init(instance, eglGetProcAddress);
@@ -544,7 +782,18 @@ bool fwr_instance_create(struct fwr_instance_opts opts, struct fwr_instance **in
   //wlr_egl_make_current(instance->egl);
 
   wlr_log(WLR_INFO, "Running Wayland compositor on WAYLAND_DISPLAY=%s", socket);
+
+  // Write socket name to file for helper scripts
+  FILE *socket_file = fopen("/tmp/avio-wayland-socket", "w");
+  if (socket_file) {
+    fprintf(socket_file, "%s", socket);
+    fclose(socket_file);
+  }
+
   wl_display_run(instance->wl_display);
+
+  // Clean up socket file
+  unlink("/tmp/avio-wayland-socket");
 
   wl_display_destroy_clients(instance->wl_display);
   wl_display_destroy(instance->wl_display);

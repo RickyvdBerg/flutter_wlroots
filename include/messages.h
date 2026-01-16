@@ -10,6 +10,8 @@ struct surface_pointer_event_message {
     uint8_t device_kind;
     double local_pos_x;
     double local_pos_y;
+    double global_pos_x;
+    double global_pos_y;
     int64_t platform_id;
     int64_t pointer;
     double widget_size_x;

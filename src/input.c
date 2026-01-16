@@ -10,6 +10,7 @@
 #include <wlr/types/wlr_pointer.h>
 
 #include <wlr/types/wlr_data_device.h>
+#include <wlr/types/wlr_primary_selection.h>
 #include <wlr/types/wlr_input_device.h>
 #include <wlr/types/wlr_keyboard.h>
 
@@ -19,6 +20,8 @@
 #include <wlr/types/wlr_seat.h>
 #include <wlr/types/wlr_xdg_shell.h>
 #include <wlr/types/wlr_scene.h>
+#include <wlr/types/wlr_compositor.h>
+#include <wlr/types/wlr_subcompositor.h>
 #include <xkbcommon/xkbcommon.h>
 #include <xkbcommon/xkbcommon-compose.h>
 #include <xkbcommon/xkbcommon-keysyms.h>
@@ -79,16 +82,20 @@ struct hit_test_result {
   struct wlr_scene_node *node;
   struct wlr_surface *surface;
   struct fwr_view *view;
+  struct fwr_popup *popup;  // Non-null if cursor is over a popup
   bool is_decoration;
   bool is_flutter;
   double nx;
   double ny;
 };
 
+// Hit test using wlroots scene graph
+// Popups are now in the scene graph, so wlr_scene_node_at handles them automatically
 static struct hit_test_result hit_test_cursor(struct fwr_instance *instance) {
   struct hit_test_result res = {0};
   res.surface = NULL;
   res.view = NULL;
+  res.popup = NULL;
   res.is_decoration = false;
   res.is_flutter = false;
 
@@ -133,9 +140,52 @@ static struct hit_test_result hit_test_cursor(struct fwr_instance *instance) {
 
   res.surface = scene_surface->surface;
 
-  struct wlr_xdg_surface *xdg_surface = wlr_xdg_surface_try_from_wlr_surface(res.surface);
+  // Check if there's a subsurface at this position
+  // wlr_surface_surface_at() traverses the surface tree including subsurfaces
+  double sub_x, sub_y;
+  struct wlr_surface *leaf_surface = wlr_surface_surface_at(
+      res.surface, res.nx, res.ny, &sub_x, &sub_y);
+  if (leaf_surface != NULL) {
+    res.surface = leaf_surface;
+    res.nx = sub_x;
+    res.ny = sub_y;
+  }
+
+  // Try to find the view or popup from the xdg_surface
+  struct wlr_xdg_surface *xdg_surface = wlr_xdg_surface_try_from_wlr_surface(scene_surface->surface);
   if (xdg_surface != NULL) {
-    res.view = xdg_surface->data;
+    if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_POPUP) {
+      // This is a popup - xdg_surface->data contains fwr_popup
+      res.popup = xdg_surface->data;
+      if (res.popup != NULL) {
+        res.view = res.popup->parent_view;
+      }
+    } else if (xdg_surface->role == WLR_XDG_SURFACE_ROLE_TOPLEVEL) {
+      // This is a toplevel - xdg_surface->data contains fwr_view
+      res.view = xdg_surface->data;
+    }
+  }
+
+  // Check if cursor is actually within the view's visual bounds (where Flutter renders it)
+  // The scene graph may extend beyond the visible window area, so verify the cursor
+  // is within the view's rendered rectangle before routing input to the surface
+  if (res.view != NULL && res.popup == NULL) {
+    int titlebar_height = res.view->uses_ssd ? 38 : 0;
+    int view_x = res.view->x;
+    int view_y = res.view->y;
+    int view_width = res.view->width;
+    int view_height = res.view->height + titlebar_height;
+
+    double cx = instance->cursor->x;
+    double cy = instance->cursor->y;
+
+    // If cursor is outside the view's visual bounds, this is Flutter UI space
+    if (cx < view_x || cx >= view_x + view_width ||
+        cy < view_y || cy >= view_y + view_height) {
+      res.is_flutter = true;
+      res.surface = NULL;
+      res.view = NULL;
+    }
   }
 
   return res;
@@ -145,6 +195,7 @@ static void send_surface_position(struct fwr_instance *instance, struct fwr_view
 static void send_grab_end(struct fwr_instance *instance, struct fwr_view *view);
 
 static void process_cursor_motion(struct fwr_instance *instance, uint32_t time) {
+  // Handle window move grab
   if (instance->input.grab.type == FWR_GRAB_MOVE) {
     struct fwr_view *view;
     if (handle_map_get(instance->views, instance->input.grab.view_handle, (void **)&view) && view != NULL) {
@@ -161,6 +212,7 @@ static void process_cursor_motion(struct fwr_instance *instance, uint32_t time) 
     return;
   }
 
+  // Handle window resize grab
   if (instance->input.grab.type == FWR_GRAB_RESIZE) {
     struct fwr_view *view;
     if (handle_map_get(instance->views, instance->input.grab.view_handle, (void **)&view) && view != NULL) {
@@ -207,24 +259,26 @@ static void process_cursor_motion(struct fwr_instance *instance, uint32_t time) 
     return;
   }
 
-  struct hit_test_result hit = hit_test_cursor(instance);
-
-  if (hit.is_flutter) {
-    wlr_seat_pointer_clear_focus(instance->seat);
-
-    FlutterPointerPhase phase = instance->input.fl_mouse_button_mask != 0 ? kMove : kHover;
-    send_flutter_mouse_event(instance, phase, kFlutterPointerSignalKindNone, 0.0, 0.0);
-    return;
+  // Direct input mode - bypass Flutter for low-latency gaming
+  if (instance->direct_input_mode && instance->direct_input_surface != 0) {
+    struct fwr_view *view;
+    if (handle_map_get(instance->views, instance->direct_input_surface, (void **)&view) && view != NULL) {
+      struct wlr_surface *surface = view->xdg_surface->surface;
+      // Calculate surface-local coordinates
+      int titlebar_height = view->uses_ssd ? 38 : 0;
+      double sx = instance->cursor->x - view->x;
+      double sy = instance->cursor->y - view->y - titlebar_height;
+      wlr_seat_pointer_notify_enter(instance->seat, surface, sx, sy);
+      wlr_seat_pointer_notify_motion(instance->seat, time, sx, sy);
+      wlr_seat_pointer_notify_frame(instance->seat);
+      return;
+    }
   }
 
-  if (hit.surface == NULL) {
-    wlr_seat_pointer_clear_focus(instance->seat);
-    return;
-  }
-
-  wlr_seat_pointer_notify_enter(instance->seat, hit.surface, hit.nx, hit.ny);
-  wlr_seat_pointer_notify_motion(instance->seat, time, hit.nx, hit.ny);
-  wlr_seat_pointer_notify_frame(instance->seat);
+  // Flutter-first: Send all motion events to Flutter
+  // Flutter's widget tree does hit testing and forwards to surfaces as needed
+  FlutterPointerPhase phase = instance->input.fl_mouse_button_mask != 0 ? kMove : kHover;
+  send_flutter_mouse_event(instance, phase, kFlutterPointerSignalKindNone, 0.0, 0.0);
 }
 
 static void on_server_cursor_motion(struct wl_listener *listener, void *data) {
@@ -255,6 +309,7 @@ static void on_server_cursor_button(struct wl_listener *listener, void *data) {
     instance->input.fl_mouse_button_mask &= ~flutter_button_mask;
   }
 
+  // Handle grab release (window move/resize)
   if (event->state == WL_POINTER_BUTTON_STATE_RELEASED &&
       event->button == BTN_LEFT &&
       instance->input.grab.type != FWR_GRAB_NONE) {
@@ -271,70 +326,62 @@ static void on_server_cursor_button(struct wl_listener *listener, void *data) {
     return;
   }
 
-  struct hit_test_result hit = hit_test_cursor(instance);
-
-  if (hit.is_flutter) {
-    wlr_seat_pointer_clear_focus(instance->seat);
-
-    if (hit.is_decoration && event->state == WL_POINTER_BUTTON_STATE_PRESSED && hit.view != NULL) {
-      fwr_focus_view(hit.view);
-      if (hit.view->scene_tree != NULL) {
-        wlr_scene_node_raise_to_top(&hit.view->scene_tree->node);
-      }
+  // Direct input mode - bypass Flutter for low-latency gaming
+  if (instance->direct_input_mode && instance->direct_input_surface != 0) {
+    struct fwr_view *view;
+    if (handle_map_get(instance->views, instance->direct_input_surface, (void **)&view) && view != NULL) {
+      wlr_seat_pointer_notify_button(instance->seat, event->time_msec, event->button, event->state);
+      wlr_seat_pointer_notify_frame(instance->seat);
+      return;
     }
+  }
 
+  // Check if a popup grab is active - wlroots needs button events for grab handling
+  bool has_popup_grab = (instance->seat->pointer_state.grab !=
+                         instance->seat->pointer_state.default_grab);
+  if (has_popup_grab) {
+    // Send to both Flutter and seat for popup dismiss handling
     send_flutter_mouse_event(instance,
       event->state == WL_POINTER_BUTTON_STATE_PRESSED ? kDown : kUp,
-      kFlutterPointerSignalKindNone,
-      0.0,
-      0.0);
-
+      kFlutterPointerSignalKindNone, 0.0, 0.0);
     wlr_seat_pointer_notify_button(instance->seat, event->time_msec, event->button, event->state);
     wlr_seat_pointer_notify_frame(instance->seat);
     return;
   }
 
-  if (hit.surface != NULL && event->state == WL_POINTER_BUTTON_STATE_PRESSED) {
-    if (hit.view != NULL) {
-      fwr_focus_view(hit.view);
-      if (hit.view->scene_tree != NULL) {
-        wlr_scene_node_raise_to_top(&hit.view->scene_tree->node);
-      }
-    }
-  }
-
-  wlr_seat_pointer_notify_button(instance->seat, event->time_msec, event->button, event->state);
-  wlr_seat_pointer_notify_frame(instance->seat);
+  // Flutter-first: Send all button events to Flutter
+  // Flutter's widget tree does hit testing and forwards to surfaces as needed
+  send_flutter_mouse_event(instance,
+    event->state == WL_POINTER_BUTTON_STATE_PRESSED ? kDown : kUp,
+    kFlutterPointerSignalKindNone, 0.0, 0.0);
 }
 
 static void on_server_cursor_axis(struct wl_listener *listener, void *data) {
   struct fwr_instance *instance = wl_container_of(listener, instance, cursor_axis);
   struct wlr_pointer_axis_event *event = data;
 
-  struct hit_test_result hit = hit_test_cursor(instance);
-
-  if (hit.is_flutter) {
-    wlr_seat_pointer_clear_focus(instance->seat);
-
-    double scroll_delta_x = 0.0;
-    double scroll_delta_y = 0.0;
-    if (event->orientation == WL_POINTER_AXIS_HORIZONTAL_SCROLL) {
-      scroll_delta_x = -event->delta;
-    } else {
-      scroll_delta_y = -event->delta;
+  // Direct input mode - bypass Flutter for low-latency gaming
+  if (instance->direct_input_mode && instance->direct_input_surface != 0) {
+    struct fwr_view *view;
+    if (handle_map_get(instance->views, instance->direct_input_surface, (void **)&view) && view != NULL) {
+      wlr_seat_pointer_notify_axis(instance->seat, event->time_msec, event->orientation,
+        event->delta, event->delta_discrete, event->source, event->relative_direction);
+      wlr_seat_pointer_notify_frame(instance->seat);
+      return;
     }
-
-    send_flutter_mouse_event(instance, kHover, kFlutterPointerSignalKindScroll, scroll_delta_x, scroll_delta_y);
-
-    wlr_seat_pointer_notify_axis(instance->seat, event->time_msec, event->orientation,
-      event->delta, event->delta_discrete, event->source, event->relative_direction);
-    wlr_seat_pointer_notify_frame(instance->seat);
-    return;
   }
 
-  wlr_seat_pointer_notify_axis(instance->seat, event->time_msec, event->orientation,
-    event->delta, event->delta_discrete, event->source, event->relative_direction);
-  wlr_seat_pointer_notify_frame(instance->seat);
+  // Flutter-first: Send all scroll events to Flutter
+  // Flutter's widget tree does hit testing and forwards to surfaces as needed
+  double scroll_delta_x = 0.0;
+  double scroll_delta_y = 0.0;
+  if (event->orientation == WL_POINTER_AXIS_HORIZONTAL_SCROLL) {
+    scroll_delta_x = -event->delta;
+  } else {
+    scroll_delta_y = -event->delta;
+  }
+
+  send_flutter_mouse_event(instance, kHover, kFlutterPointerSignalKindScroll, scroll_delta_x, scroll_delta_y);
 }
 
 static void on_server_cursor_frame(struct wl_listener *listener, void *data) {
@@ -446,12 +493,35 @@ static void on_server_cursor_touch_frame(struct wl_listener *listener, void *dat
 static void on_seat_request_cursor(struct wl_listener *listener, void *data) {
   struct fwr_instance *instance = wl_container_of(listener, instance, request_cursor);
   struct wlr_seat_pointer_request_set_cursor_event *event = data;
-  
+
   struct wlr_seat_client *focused_client = instance->seat->pointer_state.focused_client;
   if (focused_client == event->seat_client) {
+    // Track client cursor for software rendering
+    instance->client_cursor_surface = event->surface;
+    instance->client_cursor_hotspot_x = event->hotspot_x;
+    instance->client_cursor_hotspot_y = event->hotspot_y;
+
+    // Clear xcursor name when using client surface
+    if (event->surface != NULL) {
+      free(instance->current_xcursor_name);
+      instance->current_xcursor_name = NULL;
+    }
+
     wlr_cursor_set_surface(instance->cursor, event->surface,
                            event->hotspot_x, event->hotspot_y);
   }
+}
+
+static void on_seat_request_set_selection(struct wl_listener *listener, void *data) {
+  struct fwr_instance *instance = wl_container_of(listener, instance, request_set_selection);
+  struct wlr_seat_request_set_selection_event *event = data;
+  wlr_seat_set_selection(instance->seat, event->source, event->serial);
+}
+
+static void on_seat_request_set_primary_selection(struct wl_listener *listener, void *data) {
+  struct fwr_instance *instance = wl_container_of(listener, instance, request_set_primary_selection);
+  struct wlr_seat_request_set_primary_selection_event *event = data;
+  wlr_seat_set_primary_selection(instance->seat, event->source, event->serial);
 }
 
 static void keyboard_handle_modifiers(struct wl_listener *listener, void *data) {
@@ -717,7 +787,14 @@ void fwr_input_init(struct fwr_instance *instance) {
 	wlr_cursor_attach_output_layout(instance->cursor, instance->output_layout);
 
   instance->cursor_mgr = wlr_xcursor_manager_create(NULL, 24);
- 	wlr_xcursor_manager_load(instance->cursor_mgr, 1);
+  wlr_xcursor_manager_load(instance->cursor_mgr, 1);
+
+  // Initialize default cursor
+  instance->current_xcursor_name = strdup("left_ptr");
+  instance->client_cursor_surface = NULL;
+  instance->client_cursor_hotspot_x = 0;
+  instance->client_cursor_hotspot_y = 0;
+
   wlr_cursor_set_xcursor(instance->cursor, instance->cursor_mgr, "left_ptr");
 
 
@@ -725,6 +802,14 @@ void fwr_input_init(struct fwr_instance *instance) {
 
   instance->request_cursor.notify = on_seat_request_cursor;
   wl_signal_add(&instance->seat->events.request_set_cursor, &instance->request_cursor);
+
+  // Clipboard selection handlers - allows clients to copy/paste
+  instance->request_set_selection.notify = on_seat_request_set_selection;
+  wl_signal_add(&instance->seat->events.request_set_selection, &instance->request_set_selection);
+
+  // Primary selection (middle-click paste)
+  instance->request_set_primary_selection.notify = on_seat_request_set_primary_selection;
+  wl_signal_add(&instance->seat->events.request_set_primary_selection, &instance->request_set_primary_selection);
 
   instance->cursor_motion.notify = on_server_cursor_motion;
   wl_signal_add(&instance->cursor->events.motion, &instance->cursor_motion);
@@ -781,47 +866,48 @@ static bool flutter_mouse_button_to_linux(int64_t flutter_button, uint32_t *linu
   }
 }
 
-struct injected_pointer_state {
-  int64_t pointer;
+// Track button state per surface (more reliable than per-pointer which can change)
+struct surface_button_state {
+  uint32_t surface_handle;
   int64_t buttons;
   bool active;
 };
 
-static struct injected_pointer_state injected_pointer_states[16] = {0};
+static struct surface_button_state surface_button_states[32] = {0};
 
-static int64_t injected_get_buttons(int64_t pointer) {
-  for (size_t i = 0; i < sizeof(injected_pointer_states) / sizeof(injected_pointer_states[0]); i++) {
-    if (injected_pointer_states[i].active && injected_pointer_states[i].pointer == pointer) {
-      return injected_pointer_states[i].buttons;
+static int64_t get_surface_buttons(uint32_t surface_handle) {
+  for (size_t i = 0; i < sizeof(surface_button_states) / sizeof(surface_button_states[0]); i++) {
+    if (surface_button_states[i].active && surface_button_states[i].surface_handle == surface_handle) {
+      return surface_button_states[i].buttons;
     }
   }
   return 0;
 }
 
-static void injected_set_buttons(int64_t pointer, int64_t buttons) {
-  for (size_t i = 0; i < sizeof(injected_pointer_states) / sizeof(injected_pointer_states[0]); i++) {
-    if (injected_pointer_states[i].active && injected_pointer_states[i].pointer == pointer) {
-      injected_pointer_states[i].buttons = buttons;
+static void set_surface_buttons(uint32_t surface_handle, int64_t buttons) {
+  for (size_t i = 0; i < sizeof(surface_button_states) / sizeof(surface_button_states[0]); i++) {
+    if (surface_button_states[i].active && surface_button_states[i].surface_handle == surface_handle) {
+      surface_button_states[i].buttons = buttons;
       return;
     }
   }
 
-  for (size_t i = 0; i < sizeof(injected_pointer_states) / sizeof(injected_pointer_states[0]); i++) {
-    if (!injected_pointer_states[i].active) {
-      injected_pointer_states[i].active = true;
-      injected_pointer_states[i].pointer = pointer;
-      injected_pointer_states[i].buttons = buttons;
+  for (size_t i = 0; i < sizeof(surface_button_states) / sizeof(surface_button_states[0]); i++) {
+    if (!surface_button_states[i].active) {
+      surface_button_states[i].active = true;
+      surface_button_states[i].surface_handle = surface_handle;
+      surface_button_states[i].buttons = buttons;
       return;
     }
   }
 }
 
-static void injected_clear_pointer(int64_t pointer) {
-  for (size_t i = 0; i < sizeof(injected_pointer_states) / sizeof(injected_pointer_states[0]); i++) {
-    if (injected_pointer_states[i].active && injected_pointer_states[i].pointer == pointer) {
-      injected_pointer_states[i].active = false;
-      injected_pointer_states[i].pointer = 0;
-      injected_pointer_states[i].buttons = 0;
+static void clear_surface_buttons(uint32_t surface_handle) {
+  for (size_t i = 0; i < sizeof(surface_button_states) / sizeof(surface_button_states[0]); i++) {
+    if (surface_button_states[i].active && surface_button_states[i].surface_handle == surface_handle) {
+      surface_button_states[i].active = false;
+      surface_button_states[i].surface_handle = 0;
+      surface_button_states[i].buttons = 0;
       return;
     }
   }
@@ -841,19 +927,119 @@ void fwr_handle_surface_pointer_event_message(
     goto success;
   }
 
-  struct wlr_surface *surface = view->xdg_surface->surface;
-  if (surface == NULL) {
+  struct wlr_surface *parent_surface = view->xdg_surface->surface;
+  if (parent_surface == NULL) {
     goto success;
+  }
+
+  // Resolve subsurfaces - use wlr_surface_surface_at to find the actual surface
+  // at the pointer position (may be a subsurface within the parent)
+  double sub_x = message.local_pos_x;
+  double sub_y = message.local_pos_y;
+  struct wlr_surface *surface = wlr_surface_surface_at(
+      parent_surface, message.local_pos_x, message.local_pos_y, &sub_x, &sub_y);
+  if (surface == NULL) {
+    // No surface at this position, use parent with original coordinates
+    surface = parent_surface;
+    sub_x = message.local_pos_x;
+    sub_y = message.local_pos_y;
   }
 
   uint32_t time_msec = (uint32_t)(message.timestamp / 1000);
 
+  // Track Flutter cursor position for grab operations
+  instance->input.flutter_cursor_x = message.global_pos_x;
+  instance->input.flutter_cursor_y = message.global_pos_y;
+
+  // Handle active grabs (move/resize initiated by CSD apps via request_move/resize)
+  if (instance->input.grab.type != FWR_GRAB_NONE) {
+    // Button release ends the grab
+    if (message.event_type == pointerUpEvent) {
+      wlr_log(WLR_INFO, "Grab ended (type=%d) for view %d",
+              instance->input.grab.type, instance->input.grab.view_handle);
+      struct fwr_view *grab_view;
+      if (handle_map_get(instance->views, instance->input.grab.view_handle, (void **)&grab_view) && grab_view != NULL) {
+        send_grab_end(instance, grab_view);
+      }
+      instance->input.grab.type = FWR_GRAB_NONE;
+      instance->input.grab.view_handle = 0;
+    }
+    // Motion during grab - update window position/size
+    else if (message.event_type == pointerMoveEvent || message.event_type == pointerHoverEvent) {
+      // Use global position for grab calculations
+      double cursor_x = message.global_pos_x;
+      double cursor_y = message.global_pos_y;
+
+      if (instance->input.grab.type == FWR_GRAB_MOVE) {
+        struct fwr_view *grab_view;
+        if (handle_map_get(instance->views, instance->input.grab.view_handle, (void **)&grab_view) && grab_view != NULL) {
+          double dx = cursor_x - instance->input.grab.start_cursor_x;
+          double dy = cursor_y - instance->input.grab.start_cursor_y;
+          grab_view->x = instance->input.grab.start_view_x + (int)dx;
+          grab_view->y = instance->input.grab.start_view_y + (int)dy;
+          if (grab_view->scene_tree != NULL) {
+            wlr_scene_node_set_position(&grab_view->scene_tree->node, grab_view->x, grab_view->y);
+          }
+          send_surface_position(instance, grab_view);
+        }
+      } else if (instance->input.grab.type == FWR_GRAB_RESIZE) {
+        struct fwr_view *grab_view;
+        if (handle_map_get(instance->views, instance->input.grab.view_handle, (void **)&grab_view) && grab_view != NULL) {
+          double dx = cursor_x - instance->input.grab.start_cursor_x;
+          double dy = cursor_y - instance->input.grab.start_cursor_y;
+
+          int new_x = grab_view->x;
+          int new_y = grab_view->y;
+          int new_width = instance->input.grab.start_view_width;
+          int new_height = instance->input.grab.start_view_height;
+
+          uint32_t edges = instance->input.grab.resize_edges;
+          if (edges & 1) { // top
+            new_height = instance->input.grab.start_view_height - (int)dy;
+            new_y = instance->input.grab.start_view_y + (int)dy;
+          }
+          if (edges & 2) { // bottom
+            new_height = instance->input.grab.start_view_height + (int)dy;
+          }
+          if (edges & 4) { // left
+            new_width = instance->input.grab.start_view_width - (int)dx;
+            new_x = instance->input.grab.start_view_x + (int)dx;
+          }
+          if (edges & 8) { // right
+            new_width = instance->input.grab.start_view_width + (int)dx;
+          }
+
+          if (new_width < 100) new_width = 100;
+          if (new_height < 100) new_height = 100;
+
+          grab_view->x = new_x;
+          grab_view->y = new_y;
+          grab_view->width = new_width;
+          grab_view->height = new_height;
+          if (grab_view->scene_tree != NULL) {
+            wlr_scene_node_set_position(&grab_view->scene_tree->node, grab_view->x, grab_view->y);
+          }
+          if (grab_view->xdg_surface->role == WLR_XDG_SURFACE_ROLE_TOPLEVEL) {
+            wlr_xdg_toplevel_set_size(grab_view->toplevel, new_width, new_height);
+          }
+          send_surface_position(instance, grab_view);
+        }
+      }
+    }
+    goto success;  // Don't process normal events during grab
+  }
+
+  // Use subsurface-relative coordinates if we hit a subsurface
+  // sub_x/sub_y were set by wlr_surface_surface_at above
+  double local_x = sub_x;
+  double local_y = sub_y;
+
   // If we temporarily scale the client buffer during interactive resize to
   // match the Flutter widget size, we must also scale pointer coordinates back
   // into the surface's current coordinate space so hit-testing stays correct.
-  double local_x = message.local_pos_x;
-  double local_y = message.local_pos_y;
-  if (message.widget_size_x > 0.0 && message.widget_size_y > 0.0) {
+  // Note: This scaling is relative to the parent surface, so only apply if
+  // we're on the parent surface (not a subsurface)
+  if (surface == parent_surface && message.widget_size_x > 0.0 && message.widget_size_y > 0.0) {
     int surf_w = surface->current.width;
     int surf_h = surface->current.height;
     if (surf_w > 0 && surf_h > 0) {
@@ -871,7 +1057,7 @@ void fwr_handle_surface_pointer_event_message(
     wlr_seat_pointer_notify_frame(instance->seat);
   } else if (message.event_type == pointerExitEvent) {
     wlr_seat_pointer_clear_focus(instance->seat);
-    injected_clear_pointer(message.pointer);
+    // Don't clear button state on exit - track by surface handle instead
   } else if (message.event_type == pointerHoverEvent || message.event_type == pointerMoveEvent) {
     wlr_seat_pointer_notify_enter(instance->seat, surface, local_x, local_y);
     wlr_seat_pointer_notify_motion(instance->seat, time_msec, local_x, local_y);
@@ -883,7 +1069,8 @@ void fwr_handle_surface_pointer_event_message(
       wlr_scene_node_raise_to_top(&view->scene_tree->node);
     }
 
-    int64_t prev_buttons = injected_get_buttons(message.pointer);
+    // Track button state by surface handle (more reliable than pointer ID which can change)
+    int64_t prev_buttons = get_surface_buttons(message.surface_handle);
     int64_t next_buttons = message.buttons;
     int64_t changed = prev_buttons ^ next_buttons;
 
@@ -911,7 +1098,7 @@ void fwr_handle_surface_pointer_event_message(
       wlr_seat_pointer_notify_button(instance->seat, time_msec, linux_button, state);
     }
 
-    injected_set_buttons(message.pointer, next_buttons);
+    set_surface_buttons(message.surface_handle, next_buttons);
     wlr_seat_pointer_notify_frame(instance->seat);
   } else if (message.event_type == pointerScrollEvent) {
     wlr_seat_pointer_notify_enter(instance->seat, surface, local_x, local_y);
@@ -936,6 +1123,125 @@ success:
 
 error:
   wlr_log(WLR_ERROR, "Invalid surface pointer event message");
+  instance->fl_proc_table.SendPlatformMessageResponse(instance->engine, handle, NULL, 0);
+}
+
+void fwr_handle_popup_pointer_event_message(
+    struct fwr_instance *instance,
+    const FlutterPlatformMessageResponseHandle *handle,
+    struct dart_value *args) {
+  wlr_log(WLR_DEBUG, "popup_pointer_event: received message");
+
+  // Reuse the same message structure as surface_pointer_event
+  // but lookup popup by handle instead of view
+  struct surface_pointer_event_message message;
+  if (!decode_surface_pointer_event_message(args, &message)) {
+    wlr_log(WLR_ERROR, "popup_pointer_event: failed to decode message");
+    goto error;
+  }
+
+  wlr_log(WLR_DEBUG, "popup_pointer_event: decoded handle=%d type=%d",
+          message.surface_handle, message.event_type);
+
+  struct fwr_popup *popup;
+  if (!handle_map_get(instance->popups, message.surface_handle, (void **)&popup) || popup == NULL) {
+    wlr_log(WLR_DEBUG, "popup_pointer_event: popup handle %d not found", message.surface_handle);
+    goto success;
+  }
+
+  struct wlr_surface *popup_surface = popup->xdg_surface->surface;
+  if (popup_surface == NULL) {
+    goto success;
+  }
+
+  uint32_t time_msec = (uint32_t)(message.timestamp / 1000);
+
+  // Find the actual surface under cursor - Firefox renders content to subsurfaces
+  double local_x = message.local_pos_x;
+  double local_y = message.local_pos_y;
+  double sub_x, sub_y;
+  struct wlr_surface *surface = wlr_surface_surface_at(popup_surface, local_x, local_y, &sub_x, &sub_y);
+  if (surface != NULL) {
+    // Use coordinates relative to the found surface (possibly a subsurface)
+    local_x = sub_x;
+    local_y = sub_y;
+  } else {
+    // Fallback to popup surface if nothing found at coordinates
+    surface = popup_surface;
+  }
+
+  wlr_log(WLR_DEBUG, "Popup %d pointer event type=%d at (%.1f,%.1f) -> surface=%p (%.1f,%.1f)",
+          message.surface_handle, message.event_type,
+          message.local_pos_x, message.local_pos_y,
+          (void*)surface, local_x, local_y);
+
+  if (message.event_type == pointerEnterEvent) {
+    wlr_seat_pointer_notify_enter(instance->seat, surface, local_x, local_y);
+    wlr_seat_pointer_notify_frame(instance->seat);
+  } else if (message.event_type == pointerExitEvent) {
+    // Don't clear focus on popup exit - let the parent or next popup handle it
+    wlr_seat_pointer_notify_frame(instance->seat);
+  } else if (message.event_type == pointerHoverEvent || message.event_type == pointerMoveEvent) {
+    wlr_seat_pointer_notify_enter(instance->seat, surface, local_x, local_y);
+    wlr_seat_pointer_notify_motion(instance->seat, time_msec, local_x, local_y);
+    wlr_seat_pointer_notify_frame(instance->seat);
+  } else if (message.event_type == pointerDownEvent || message.event_type == pointerUpEvent) {
+    wlr_seat_pointer_notify_enter(instance->seat, surface, local_x, local_y);
+
+    // Track button state by popup handle
+    int64_t prev_buttons = get_surface_buttons(message.surface_handle + 200000); // Offset to avoid collision with surface handles
+    int64_t next_buttons = message.buttons;
+    int64_t changed = prev_buttons ^ next_buttons;
+
+    const int64_t flutter_buttons[] = {
+        kFlutterPointerButtonMousePrimary,
+        kFlutterPointerButtonMouseSecondary,
+        kFlutterPointerButtonMouseMiddle,
+        kFlutterPointerButtonMouseBack,
+        kFlutterPointerButtonMouseForward,
+    };
+
+    for (size_t i = 0; i < sizeof(flutter_buttons) / sizeof(flutter_buttons[0]); i++) {
+      int64_t flutter_button = flutter_buttons[i];
+      if ((changed & flutter_button) == 0) {
+        continue;
+      }
+
+      uint32_t linux_button;
+      if (!flutter_mouse_button_to_linux(flutter_button, &linux_button)) {
+        continue;
+      }
+
+      enum wl_pointer_button_state state =
+          (next_buttons & flutter_button) ? WL_POINTER_BUTTON_STATE_PRESSED : WL_POINTER_BUTTON_STATE_RELEASED;
+      wlr_seat_pointer_notify_button(instance->seat, time_msec, linux_button, state);
+    }
+
+    set_surface_buttons(message.surface_handle + 200000, next_buttons);
+    wlr_seat_pointer_notify_frame(instance->seat);
+  } else if (message.event_type == pointerScrollEvent) {
+    wlr_seat_pointer_notify_enter(instance->seat, surface, local_x, local_y);
+
+    if (message.scroll_delta_x != 0.0) {
+      wlr_seat_pointer_notify_axis(instance->seat, time_msec, WL_POINTER_AXIS_HORIZONTAL_SCROLL,
+          -message.scroll_delta_x, 0, WL_POINTER_AXIS_SOURCE_WHEEL, 0);
+    }
+    if (message.scroll_delta_y != 0.0) {
+      wlr_seat_pointer_notify_axis(instance->seat, time_msec, WL_POINTER_AXIS_VERTICAL_SCROLL,
+          -message.scroll_delta_y, 0, WL_POINTER_AXIS_SOURCE_WHEEL, 0);
+    }
+
+    wlr_seat_pointer_notify_frame(instance->seat);
+  }
+
+success:
+  instance->fl_proc_table.SendPlatformMessageResponse(
+      instance->engine, handle, method_call_null_success,
+      sizeof(method_call_null_success));
+  return;
+
+error:
+  wlr_log(WLR_ERROR, "Invalid popup pointer event message");
   instance->fl_proc_table.SendPlatformMessageResponse(instance->engine, handle, NULL, 0);
 }
 

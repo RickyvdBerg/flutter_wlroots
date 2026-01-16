@@ -22,6 +22,7 @@ wayland_server_dep = dependency('wayland-server')
 
 glesv2_dep = dependency('glesv2')
 egl_dep = dependency('egl')
+libdrm_dep = dependency('libdrm')
 
 fwr_src = []
 
@@ -32,6 +33,7 @@ fwr_deps = [
   glesv2_dep,
   egl_dep,
   threads_dep,
+  libdrm_dep,
 ]
 
 builtin_plugins = get_option('builtin_plugins')

@@ -41,6 +41,11 @@ struct fwr_input_state {
     int touch_pointer_simulation_id;
     int64_t touch_ids[FWR_MULTITOUCH_MAX];
 
+    // Flutter cursor position (from platform channel events)
+    // Used for grab operations when running nested
+    double flutter_cursor_x;
+    double flutter_cursor_y;
+
     struct fwr_grab_state grab;
 };
 
@@ -62,3 +67,5 @@ void fwr_handle_surface_keyboard_key_message(struct fwr_instance *instance, cons
 void fwr_handle_surface_begin_move(struct fwr_instance *instance, const FlutterPlatformMessageResponseHandle *handle, struct dart_value *args);
 
 void fwr_handle_surface_begin_resize(struct fwr_instance *instance, const FlutterPlatformMessageResponseHandle *handle, struct dart_value *args);
+
+void fwr_handle_popup_pointer_event_message(struct fwr_instance *instance, const FlutterPlatformMessageResponseHandle *handle, struct dart_value *args);

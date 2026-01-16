@@ -1,8 +1,10 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
+#include <drm_fourcc.h>
 #include <wayland-server-core.h>
 #include <wayland-util.h>
 #include <instance.h>
@@ -14,9 +16,114 @@
 #include <wlr/types/wlr_scene.h>
 #include <wlr/types/wlr_compositor.h>
 #include <wlr/types/wlr_xdg_shell.h>
+#include <wlr/types/wlr_cursor.h>
+#include <wlr/types/wlr_xcursor_manager.h>
 #include <wlr/render/pass.h>
+#include <wlr/backend.h>
+#include <wlr/backend/wayland.h>
+#include <wlr/backend/x11.h>
+#include <wlr/backend/multi.h>
 
 #include "renderer.h"
+#include "handle_map.h"
+
+// Cached xcursor texture for software rendering
+static struct wlr_texture *xcursor_texture = NULL;
+static char *xcursor_texture_name = NULL;
+
+// Check if a backend is nested (running inside another compositor)
+static bool is_nested_backend(struct wlr_backend *backend) {
+  if (backend == NULL) {
+    return false;
+  }
+  if (wlr_backend_is_wl(backend) || wlr_backend_is_x11(backend)) {
+    return true;
+  }
+  // For multi-backend, check each child
+  if (wlr_backend_is_multi(backend)) {
+    // Multi-backend created by autocreate will have nested if WAYLAND_DISPLAY is set
+    // The multi backend combines multiple backends; if any is WL/X11, we're nested
+    // However, there's no easy way to iterate children, so check environment
+    return getenv("WAYLAND_DISPLAY") != NULL || getenv("DISPLAY") != NULL;
+  }
+  return false;
+}
+
+// Render software cursor on the output
+static void render_cursor(struct fwr_instance *instance, struct wlr_render_pass *render_pass) {
+  if (instance->cursor == NULL || instance->renderer == NULL) {
+    return;
+  }
+
+  // Skip software cursor rendering in nested mode (host handles cursor)
+  if (is_nested_backend(instance->backend)) {
+    return;
+  }
+
+  struct wlr_texture *cursor_texture = NULL;
+  int hotspot_x = 0;
+  int hotspot_y = 0;
+
+  // Try client-provided cursor surface first
+  if (instance->client_cursor_surface != NULL &&
+      instance->client_cursor_surface->mapped) {
+    cursor_texture = wlr_surface_get_texture(instance->client_cursor_surface);
+    hotspot_x = instance->client_cursor_hotspot_x;
+    hotspot_y = instance->client_cursor_hotspot_y;
+  }
+  // Fall back to xcursor
+  else if (instance->current_xcursor_name != NULL && instance->cursor_mgr != NULL) {
+    struct wlr_xcursor *xcursor = wlr_xcursor_manager_get_xcursor(
+        instance->cursor_mgr, instance->current_xcursor_name, 1);
+    if (xcursor != NULL && xcursor->image_count > 0) {
+      struct wlr_xcursor_image *image = xcursor->images[0];
+      hotspot_x = image->hotspot_x;
+      hotspot_y = image->hotspot_y;
+
+      // Create or reuse cached texture for this xcursor
+      if (xcursor_texture == NULL ||
+          xcursor_texture_name == NULL ||
+          strcmp(xcursor_texture_name, instance->current_xcursor_name) != 0) {
+        // Destroy old texture
+        if (xcursor_texture != NULL) {
+          wlr_texture_destroy(xcursor_texture);
+          xcursor_texture = NULL;
+        }
+        free(xcursor_texture_name);
+        xcursor_texture_name = NULL;
+
+        // Create texture from xcursor image
+        xcursor_texture = wlr_texture_from_pixels(instance->renderer,
+            DRM_FORMAT_ARGB8888, image->width * 4,
+            image->width, image->height, image->buffer);
+
+        if (xcursor_texture != NULL) {
+          xcursor_texture_name = strdup(instance->current_xcursor_name);
+        }
+      }
+      cursor_texture = xcursor_texture;
+    }
+  }
+
+  if (cursor_texture == NULL) {
+    return;
+  }
+
+  int cursor_x = (int)instance->cursor->x - hotspot_x;
+  int cursor_y = (int)instance->cursor->y - hotspot_y;
+
+  struct wlr_box cursor_box = {
+    .x = cursor_x,
+    .y = cursor_y,
+    .width = cursor_texture->width,
+    .height = cursor_texture->height,
+  };
+
+  wlr_render_pass_add_texture(render_pass, &(struct wlr_render_texture_options){
+    .texture = cursor_texture,
+    .dst_box = cursor_box,
+  });
+}
 
 static void output_frame(struct wl_listener *listener, void *data) {
   struct fwr_output *output = wl_container_of(listener, output, frame);
@@ -63,6 +170,9 @@ static void output_frame(struct wl_listener *listener, void *data) {
   // This is the Flutter-centric path: NO CPU READBACK
   fwr_renderer_render_scene(instance, render_pass);
 
+  // Render software cursor on top of everything
+  render_cursor(instance, render_pass);
+
   // Submit render pass
   if (!wlr_render_pass_submit(render_pass)) {
     wlr_output_state_finish(&output_state);
@@ -84,6 +194,20 @@ static void output_frame(struct wl_listener *listener, void *data) {
       wlr_surface_send_frame_done(view->xdg_surface->surface, &now);
     }
   }
+
+  // Send frame done to popup surfaces too
+  struct handle_map_iter *iter = handle_map_iter_new(instance->popups);
+  uint32_t handle;
+  void *value;
+  while (handle_map_iter_next(iter, &handle, &value)) {
+    struct fwr_popup *popup = (struct fwr_popup *)value;
+    if (popup != NULL && popup->xdg_surface != NULL &&
+        popup->xdg_surface->surface != NULL &&
+        popup->xdg_surface->surface->mapped) {
+      wlr_surface_send_frame_done(popup->xdg_surface->surface, &now);
+    }
+  }
+  handle_map_iter_destroy(iter);
 
 out:
   wlr_output_schedule_frame(wlr_output);

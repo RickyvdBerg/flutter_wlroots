@@ -1,5 +1,7 @@
+import 'dart:async';
+
 import 'package:compositor_dart/compositor_dart.dart';
-export 'package:compositor_dart/compositor_dart.dart' show Surface;
+export 'package:compositor_dart/compositor_dart.dart' show Surface, Subsurface;
 import 'package:compositor_dart/constants.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
@@ -56,11 +58,21 @@ class SurfaceView extends StatefulWidget {
 
 class _SurfaceViewState extends State<SurfaceView> {
   late _CompositorPlatformViewController controller;
+  StreamSubscription<Surface>? _updateSubscription;
+  List<Subsurface> _subsurfaces = [];
 
   @override
   void initState() {
     super.initState();
     controller = _CompositorPlatformViewController(surface: widget.surface);
+    _subsurfaces = List.from(widget.surface.subsurfaces);
+    _updateSubscription = Compositor.compositor.surfaceUpdated.stream.listen((surface) {
+      if (surface.handle == widget.surface.handle) {
+        setState(() {
+          _subsurfaces = List.from(widget.surface.subsurfaces);
+        });
+      }
+    });
   }
 
   @override
@@ -69,13 +81,32 @@ class _SurfaceViewState extends State<SurfaceView> {
     if (oldWidget.surface != widget.surface) {
       controller.dispose();
       controller = _CompositorPlatformViewController(surface: widget.surface);
+      _subsurfaces = List.from(widget.surface.subsurfaces);
     }
+  }
+
+  @override
+  void dispose() {
+    _updateSubscription?.cancel();
+    super.dispose();
+  }
+
+  void _onPointerDown(PointerDownEvent event) {
+    // Focus the surface when clicked
+    Compositor.compositor.platform.surfaceFocus(widget.surface);
+    controller.dispatchPointerEvent(event);
   }
 
   @override
   Widget build(BuildContext context) {
     return Listener(
+      onPointerDown: _onPointerDown,
+      onPointerMove: controller.dispatchPointerEvent,
+      onPointerUp: controller.dispatchPointerEvent,
+      onPointerHover: controller.dispatchPointerEvent,
+      onPointerCancel: controller.dispatchPointerEvent,
       onPointerSignal: controller.dispatchPointerEvent,
+      behavior: HitTestBehavior.opaque,
       child: Focus(
         onKeyEvent: (node, event) {
           final KeyStatus status;
@@ -107,9 +138,52 @@ class _SurfaceViewState extends State<SurfaceView> {
               controller.setSize(size);
             }
           },
-          child: Texture(textureId: widget.surface.textureId),
+          child: _buildSurfaceTree(),
         ),
       ),
+    );
+  }
+
+  /// Builds the surface tree with toplevel + all subsurfaces as a Stack.
+  Widget _buildSurfaceTree() {
+    final surface = widget.surface;
+
+    Widget mainTexture = Texture(textureId: surface.textureId);
+
+    if (_subsurfaces.isEmpty) {
+      return mainTexture;
+    }
+
+    // Render toplevel + subsurfaces as a Stack
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        mainTexture,
+        ..._subsurfaces.map((sub) => Positioned(
+          left: sub.x.toDouble(),
+          top: sub.y.toDouble(),
+          width: sub.width > 0 ? sub.width.toDouble() : null,
+          height: sub.height > 0 ? sub.height.toDouble() : null,
+          child: Texture(textureId: sub.textureId),
+        )),
+      ],
+    );
+  }
+}
+
+/// Widget for rendering popup surfaces (menus, dropdowns)
+/// Input is handled directly by wlroots via cursor hit testing, not Flutter
+class PopupView extends StatelessWidget {
+  final Popup popup;
+
+  const PopupView({Key? key, required this.popup}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    // IgnorePointer ensures Flutter doesn't intercept pointer events
+    // wlroots handles popup input directly via cursor motion/button handlers
+    return IgnorePointer(
+      child: Texture(textureId: popup.textureId),
     );
   }
 }
@@ -123,6 +197,12 @@ class _CompositorPlatformViewController extends PlatformViewController {
   void setSize(Size size) {
     this.size = size;
     Compositor.compositor.platform.surfaceToplevelSetSize(surface, size.width.round(), size.height.round());
+  }
+
+  /// Transform widget-relative coordinates to surface coordinates.
+  /// Simple pass-through - let wlroots handle coordinate mapping.
+  Offset _toSurfaceCoords(Offset widgetPos) {
+    return widgetPos;
   }
 
   @override
@@ -166,6 +246,9 @@ class _CompositorPlatformViewController extends PlatformViewController {
       eventType = pointerUnknownEvent;
     }
 
+    // Simple coordinate pass-through
+    final surfacePos = _toSurfaceCoords(event.localPosition);
+
     List data = [
       surface.handle,
       event.buttons,
@@ -178,8 +261,8 @@ class _CompositorPlatformViewController extends PlatformViewController {
       deviceKind,
       event.localDelta.dx,
       event.localDelta.dy,
-      event.localPosition.dx,
-      event.localPosition.dy,
+      surfacePos.dx,
+      surfacePos.dy,
       event.obscured,
       event.orientation,
       event.platformData,

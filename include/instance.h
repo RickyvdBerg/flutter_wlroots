@@ -40,16 +40,27 @@ struct fwr_instance {
 
   struct wlr_xdg_shell *xdg_shell;
   struct wl_listener new_xdg_toplevel;
+  struct wl_listener new_xdg_popup;
 
   struct wlr_xdg_decoration_manager_v1 *decoration_manager;
   struct wl_listener new_toplevel_decoration;
 
+  // Legacy KDE server decoration protocol
+  struct wlr_server_decoration_manager *legacy_decoration_manager;
+  struct wl_listener new_server_decoration;
+
   struct handle_map *views;
+  struct handle_map *subsurfaces;  // Handle map for subsurface texture lookup
+  struct handle_map *popups;       // Handle map for popup surfaces
   struct wl_list views_list;
   uint32_t current_focused_view;
 
   struct wlr_cursor *cursor;
   struct wlr_xcursor_manager *cursor_mgr;
+  char *current_xcursor_name;  // Current xcursor name for software rendering
+  struct wlr_surface *client_cursor_surface;  // Client-provided cursor surface
+  int32_t client_cursor_hotspot_x;
+  int32_t client_cursor_hotspot_y;
   struct wl_listener cursor_motion;
   struct wl_listener cursor_motion_absolute;
   struct wl_listener cursor_button;
@@ -66,6 +77,12 @@ struct fwr_instance {
   struct wl_list keyboards;
 
   struct wlr_seat *seat;
+  struct wl_listener request_set_selection;
+  struct wl_listener request_set_primary_selection;
+
+  // Direct input mode - bypasses Flutter for low-latency gaming
+  bool direct_input_mode;
+  uint32_t direct_input_surface;  // Surface handle for direct input
 
   struct wlr_output_layout *output_layout;
   struct wlr_scene *scene;
@@ -121,9 +138,20 @@ struct fwr_view {
   int width;
   int height;
 
+  // Geometry offset - where visible content starts within the buffer
+  // Used by CSD apps that include shadows in their buffer
+  int geo_x;
+  int geo_y;
+
   bool maximized;
   bool fullscreen;
   bool activated;
+
+  // Decoration tracking - true if we successfully negotiated SSD with the client
+  struct wlr_xdg_toplevel_decoration_v1 *decoration;
+  bool uses_ssd;
+  struct wl_listener decoration_request_mode;
+  struct wl_listener decoration_destroy;
 
   // Flutter external texture ID for this surface (same as handle for simplicity)
   int64_t texture_id;
@@ -131,6 +159,12 @@ struct fwr_view {
 
   GLuint cached_tex;
   GLuint cached_fbo;
+  int cached_tex_width;
+  int cached_tex_height;
+
+  // Subsurface tracking
+  struct wl_list subsurfaces;  // List of fwr_subsurface
+  struct wl_listener new_subsurface;
 
   struct wlr_scene_tree *scene_tree;
   struct wlr_scene_tree *scene_xdg_tree;
@@ -143,6 +177,10 @@ struct fwr_view {
   struct wl_listener commit;
   struct wl_listener set_title;
   struct wl_listener set_app_id;
+  struct wl_listener request_move;
+  struct wl_listener request_resize;
+  struct wl_listener request_minimize;
+  struct wl_listener request_maximize;
 };
 
 struct fwr_keyboard {
@@ -154,4 +192,65 @@ struct fwr_keyboard {
   struct wl_listener modifiers;
   struct wl_listener key;
   struct wl_listener destroy;
+};
+
+// Subsurface tracking for zero-copy texture approach
+struct fwr_subsurface {
+  struct wl_list link;  // Link in parent view's subsurface list
+  uint32_t handle;      // Unique handle for this subsurface
+
+  struct fwr_view *parent_view;
+  struct wlr_subsurface *wlr_subsurface;
+  struct wlr_surface *surface;
+
+  int x, y;             // Position relative to parent
+  int width, height;
+
+  int64_t texture_id;
+  bool texture_registered;
+
+  GLuint cached_tex;
+  GLuint cached_fbo;
+  int cached_tex_width;
+  int cached_tex_height;
+
+  struct wl_listener map;
+  struct wl_listener unmap;
+  struct wl_listener destroy;
+  struct wl_listener commit;
+};
+
+// Popup surfaces (menus, dropdowns, tooltips)
+struct fwr_popup {
+  uint32_t handle;
+
+  struct fwr_instance *instance;
+  struct wlr_xdg_popup *xdg_popup;
+  struct wlr_xdg_surface *xdg_surface;
+
+  // Parent can be a toplevel view or another popup
+  struct fwr_view *parent_view;
+  uint32_t parent_view_handle;
+
+  // Position relative to parent (from xdg_positioner)
+  int x, y;
+  int width, height;
+
+  // Scene tree for wlroots rendering and input handling
+  struct wlr_scene_tree *scene_tree;
+
+  int64_t texture_id;
+  bool texture_registered;
+  bool unconstrained;  // Whether unconstrain has been called
+
+  GLuint cached_tex;
+  GLuint cached_fbo;
+  int cached_tex_width;
+  int cached_tex_height;
+
+  struct wl_listener map;
+  struct wl_listener unmap;
+  struct wl_listener destroy;
+  struct wl_listener commit;
+  struct wl_listener reposition;
 };

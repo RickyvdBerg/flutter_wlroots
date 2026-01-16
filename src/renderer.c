@@ -968,17 +968,21 @@ static void render_scene_layer_platform(struct fwr_instance *instance, struct wl
 GLuint fwr_renderer_copy_texture(struct fwr_instance *instance,
                                  GLuint texture, GLenum target,
                                  int width, int height,
-                                 GLuint *cached_tex, GLuint *cached_fbo) {
+                                 GLuint *cached_tex, GLuint *cached_fbo,
+                                 int *cached_width, int *cached_height) {
   if (eglGetCurrentContext() == EGL_NO_CONTEXT) {
     wlr_log(WLR_ERROR, "No current EGL context in copy_texture!");
     return 0;
   }
 
-  wlr_log(WLR_INFO, "Copying texture %d (target 0x%x) %dx%d", texture, target, width, height);
   struct fwr_renderer *renderer = &instance->fwr_renderer;
   struct gl_fns *fns = &renderer->fns;
 
-  // Create texture if needed
+  // Check if we need to (re)create texture
+  bool need_alloc = (*cached_tex == 0) ||
+                    (cached_width && *cached_width != width) ||
+                    (cached_height && *cached_height != height);
+
   if (*cached_tex == 0) {
     fns->glGenTextures(1, cached_tex);
     if (*cached_tex == 0) {
@@ -990,11 +994,15 @@ GLuint fwr_renderer_copy_texture(struct fwr_instance *instance,
     fns->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     fns->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     fns->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    fns->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
   } else {
-    // Reallocate (simple approach)
     fns->glBindTexture(GL_TEXTURE_2D, *cached_tex);
+  }
+
+  // Only reallocate texture storage if size changed
+  if (need_alloc) {
     fns->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    if (cached_width) *cached_width = width;
+    if (cached_height) *cached_height = height;
   }
 
   // Create FBO if needed
@@ -1016,6 +1024,14 @@ GLuint fwr_renderer_copy_texture(struct fwr_instance *instance,
   GLint viewport[4];
   fns->glGetIntegerv(GL_VIEWPORT, viewport);
   fns->glViewport(0, 0, width, height);
+
+  // Ensure clean state for alpha preservation
+  fns->glDisable(GL_BLEND);
+  fns->glDisable(GL_SCISSOR_TEST);
+
+  // Clear to fully transparent - critical for alpha shadows
+  fns->glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+  fns->glClear(GL_COLOR_BUFFER_BIT);
 
   GLint old_prog;
   fns->glGetIntegerv(GL_CURRENT_PROGRAM, &old_prog);
@@ -1066,7 +1082,7 @@ GLuint fwr_renderer_copy_texture(struct fwr_instance *instance,
   fns->glBindTexture(target, 0);
   fns->glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
 
-  wlr_log(WLR_INFO, "Copy done. Result tex: %d", *cached_tex);
+  // wlr_log(WLR_DEBUG, "Copy done. Result tex: %d", *cached_tex);
   return *cached_tex;
 }
 
@@ -1157,6 +1173,10 @@ void fwr_renderer_render_scene(struct fwr_instance *instance, struct wlr_render_
       renderer->current_scene.sync = 0;
   }
 
+  // Per-frame layer logging disabled - too verbose
+  // static int log_counter = 0;
+  // bool should_log = (log_counter++ % 300 == 0);
+
   for (int i = 0; i < renderer->current_scene.layers_count; i++) {
     struct fwr_renderer_scene_layer *layer = &renderer->current_scene.layers[i];
     switch (layer->type) {
@@ -1173,75 +1193,23 @@ void fwr_renderer_render_scene(struct fwr_instance *instance, struct wlr_render_
 }
 
 void fwr_renderer_update_scene_positions(struct fwr_instance *instance) {
-  struct fwr_renderer *renderer = &instance->fwr_renderer;
-
   if (instance->scene == NULL) {
     return;
   }
 
-  pthread_mutex_lock(&renderer->render_mutex);
+  // Scene node enable/disable is managed by map/unmap handlers.
+  // Here we just sync positions with Flutter's view positions.
+  // Views rendered via external textures won't have platform layers,
+  // so we update all mapped views directly.
 
-  // First disable all view scene nodes
-  struct fwr_view *list_view;
-  wl_list_for_each(list_view, &instance->views_list, link) {
-    if (list_view->scene_tree != NULL) {
-      wlr_scene_node_set_enabled(&list_view->scene_tree->node, false);
+  struct fwr_view *view;
+  wl_list_for_each(view, &instance->views_list, link) {
+    if (view->scene_tree == NULL) {
+      continue;
     }
+    // Position is set by surface_set_position platform channel message
+    // Note: wlr_scene_xdg_surface handles geometry offset internally
+    int titlebar_offset = view->uses_ssd ? 38 : 0;
+    wlr_scene_node_set_position(&view->scene_tree->node, view->x, view->y + titlebar_offset);
   }
-
-  // Update positions for platform view layers (for input hit-testing)
-  for (size_t i = 0; i < renderer->current_scene.layers_count; i++) {
-    struct fwr_renderer_scene_layer *layer = &renderer->current_scene.layers[i];
-
-    if (layer->type != sceneLayerPlatform) {
-      continue;
-    }
-
-    uint32_t view_handle = (uint32_t)layer->platform.platform_view_id;
-    struct fwr_view *view;
-    if (!handle_map_get(instance->views, view_handle, (void**)&view)) {
-      continue;
-    }
-    if (view == NULL || view->scene_tree == NULL) {
-      continue;
-    }
-
-    // Calculate transform from mutations
-    FlutterTransformation current_transform = (FlutterTransformation){1, 0, 0, 0, 1, 0, 0, 0, 1};
-    bool transform_affine = true;
-
-    for (size_t m = 0; m < layer->platform.mutations_count; m++) {
-      const FlutterPlatformViewMutation *mutation = &layer->platform.mutations[m];
-      if (mutation->type != kFlutterPlatformViewMutationTypeTransformation) {
-        continue;
-      }
-
-      FlutterTransformation mutation_transform = mutation->transformation;
-      if (!flutter_transform_is_affine(mutation_transform)) {
-        transform_affine = false;
-        break;
-      }
-
-      current_transform = flutter_transform_multiply(mutation_transform, current_transform);
-    }
-
-    double x = (double)layer->offset.x;
-    double y = (double)layer->offset.y;
-
-    if (transform_affine && current_transform.scaleX == 1.0 && current_transform.scaleY == 1.0 &&
-        current_transform.skewX == 0.0 && current_transform.skewY == 0.0 &&
-        layer->offset.x == 0.0 && layer->offset.y == 0.0 &&
-        (current_transform.transX != 0.0 || current_transform.transY != 0.0)) {
-      x += current_transform.transX;
-      y += current_transform.transY;
-    }
-
-    view->x = (int)lround(x);
-    view->y = (int)lround(y);
-    wlr_scene_node_set_position(&view->scene_tree->node, view->x, view->y);
-    wlr_scene_node_set_enabled(&view->scene_tree->node, true);
-    wlr_scene_node_raise_to_top(&view->scene_tree->node);
-  }
-
-  pthread_mutex_unlock(&renderer->render_mutex);
 }
