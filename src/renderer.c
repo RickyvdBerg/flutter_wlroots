@@ -971,24 +971,33 @@ void fwr_cached_texture_destroy(struct fwr_instance *instance,
     return;
   }
 
+  // Use wlroots EGL context for deletion (shares resources with Flutter context)
+  // This avoids EGL_BAD_ACCESS when Flutter's render thread owns flutter_egl_context
   EGLContext prev_ctx = eglGetCurrentContext();
-  eglMakeCurrent(instance->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
-                 instance->fwr_renderer.flutter_egl_context);
+  EGLSurface prev_draw = eglGetCurrentSurface(EGL_DRAW);
+  EGLSurface prev_read = eglGetCurrentSurface(EGL_READ);
 
-  struct gl_fns *fns = &instance->fwr_renderer.fns;
-  if (cache->tex != 0) {
-    fns->glDeleteTextures(1, &cache->tex);
-    cache->tex = 0;
+  if (!eglMakeCurrent(instance->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                      instance->egl_context)) {
+    // If wlroots context also fails, log but still clean up cache fields
+    wlr_log(WLR_ERROR, "Failed to bind EGL context for texture cleanup");
+  } else {
+    struct gl_fns *fns = &instance->fwr_renderer.fns;
+    if (cache->tex != 0) {
+      fns->glDeleteTextures(1, &cache->tex);
+    }
+    if (cache->fbo != 0) {
+      fns->glDeleteFramebuffers(1, &cache->fbo);
+    }
+
+    eglMakeCurrent(instance->egl_display, prev_draw, prev_read, prev_ctx);
   }
-  if (cache->fbo != 0) {
-    fns->glDeleteFramebuffers(1, &cache->fbo);
-    cache->fbo = 0;
-  }
+
+  cache->tex = 0;
+  cache->fbo = 0;
   cache->width = 0;
   cache->height = 0;
   cache->last_seq = 0;
-
-  eglMakeCurrent(instance->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, prev_ctx);
 }
 
 GLuint fwr_renderer_copy_texture(struct fwr_instance *instance,
