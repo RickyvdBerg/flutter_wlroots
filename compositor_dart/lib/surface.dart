@@ -183,6 +183,10 @@ class _SurfaceViewState extends State<SurfaceView> {
     controller.dispatchPointerEvent(event);
   }
 
+  void _onPointerSignal(PointerSignalEvent event) {
+    controller.dispatchPointerEvent(event);
+  }
+
   @override
   Widget build(BuildContext context) {
     return Listener(
@@ -191,7 +195,7 @@ class _SurfaceViewState extends State<SurfaceView> {
       onPointerUp: controller.dispatchPointerEvent,
       onPointerHover: controller.dispatchPointerEvent,
       onPointerCancel: controller.dispatchPointerEvent,
-      onPointerSignal: controller.dispatchPointerEvent,
+      onPointerSignal: _onPointerSignal,
       behavior: HitTestBehavior.opaque,
       child: Focus(
         onKeyEvent: (node, event) {
@@ -285,6 +289,10 @@ class _PopupViewState extends State<PopupView> {
     }
   }
 
+  void _onPointerSignal(PointerSignalEvent event) {
+    _controller.dispatchPointerEvent(event);
+  }
+
   @override
   Widget build(BuildContext context) {
     // Use Listener to capture all pointer events and forward to wlroots
@@ -295,7 +303,7 @@ class _PopupViewState extends State<PopupView> {
       onPointerUp: _controller.dispatchPointerEvent,
       onPointerHover: _controller.dispatchPointerEvent,
       onPointerCancel: _controller.dispatchPointerEvent,
-      onPointerSignal: _controller.dispatchPointerEvent,
+      onPointerSignal: _onPointerSignal,
       behavior: HitTestBehavior.opaque,
       child: Texture(textureId: widget.popup.textureId),
     );

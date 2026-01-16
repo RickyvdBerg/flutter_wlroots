@@ -27,6 +27,18 @@ struct fwr_grab_state {
     uint32_t resize_edges;
 };
 
+// Cache for original wlroots scroll event parameters.
+// Used to pass accurate scroll data through the Flutter-first path.
+struct fwr_scroll_cache {
+    double delta;
+    int32_t delta_discrete;
+    uint32_t source;  // enum wl_pointer_axis_source
+    uint32_t relative_direction;  // enum wl_pointer_axis_relative_direction
+    uint32_t orientation;  // enum wl_pointer_axis
+    uint32_t time_msec;
+    bool valid;
+};
+
 struct fwr_input_state {
     uint32_t mouse_button_mask;
     uint32_t fl_mouse_button_mask;
@@ -45,6 +57,11 @@ struct fwr_input_state {
     // Used for grab operations when running nested
     double flutter_cursor_x;
     double flutter_cursor_y;
+
+    // Cached scroll event for Flutter-first path
+    // Stores original wlroots parameters to pass through platform channel
+    struct fwr_scroll_cache last_scroll_x;
+    struct fwr_scroll_cache last_scroll_y;
 
     struct fwr_grab_state grab;
 };

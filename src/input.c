@@ -75,6 +75,7 @@ static void send_flutter_mouse_event(struct fwr_instance *instance,
   pointer_event.scroll_delta_y = scroll_delta_y;
   pointer_event.device_kind = kFlutterPointerDeviceKindMouse;
   pointer_event.buttons = instance->input.fl_mouse_button_mask;
+
   instance->fl_proc_table.SendPointerEvent(instance->engine, &pointer_event, 1);
 }
 
@@ -258,25 +259,40 @@ static void on_server_cursor_axis(struct wl_listener *listener, void *data) {
     }
   }
 
-  // Scroll events use hybrid approach: send directly to focused surface AND to Flutter
-  // This is necessary because Flutter's onPointerSignal doesn't reliably receive scroll
-  // events from the embedder. The direct seat notification ensures Wayland clients
-  // receive scroll, while Flutter gets it for UI feedback (scroll indicators, etc.)
+  // Flutter-first: send scroll to Flutter, which does hit-testing and forwards
+  // to the correct surface via platform channel -> fwr_handle_surface_pointer_event
+  //
+  // Cache the original wlroots scroll parameters so we can use them when
+  // the platform channel response arrives. This preserves delta_discrete,
+  // source, and relative_direction for proper Wayland client compatibility.
   double scroll_delta_x = 0.0;
   double scroll_delta_y = 0.0;
+
   if (event->orientation == WL_POINTER_AXIS_HORIZONTAL_SCROLL) {
     scroll_delta_x = -event->delta;
+    instance->input.last_scroll_x = (struct fwr_scroll_cache){
+      .delta = event->delta,
+      .delta_discrete = event->delta_discrete,
+      .source = event->source,
+      .relative_direction = event->relative_direction,
+      .orientation = event->orientation,
+      .time_msec = event->time_msec,
+      .valid = true,
+    };
   } else {
     scroll_delta_y = -event->delta;
+    instance->input.last_scroll_y = (struct fwr_scroll_cache){
+      .delta = event->delta,
+      .delta_discrete = event->delta_discrete,
+      .source = event->source,
+      .relative_direction = event->relative_direction,
+      .orientation = event->orientation,
+      .time_msec = event->time_msec,
+      .valid = true,
+    };
   }
 
-  // Send to Flutter for UI feedback
   send_flutter_mouse_event(instance, kHover, kFlutterPointerSignalKindScroll, scroll_delta_x, scroll_delta_y);
-
-  // Send directly to wlroots seat for Wayland client
-  wlr_seat_pointer_notify_axis(instance->seat, event->time_msec, event->orientation,
-      event->delta, event->delta_discrete, event->source, event->relative_direction);
-  wlr_seat_pointer_notify_frame(instance->seat);
 }
 
 static void on_server_cursor_frame(struct wl_listener *listener, void *data) {
@@ -1024,17 +1040,24 @@ void fwr_handle_surface_pointer_event_message(
     set_surface_buttons(message.surface_handle, next_buttons);
     wlr_seat_pointer_notify_frame(instance->seat);
   } else if (message.event_type == pointerScrollEvent) {
-    // Note: Scroll events are also sent directly via on_server_cursor_axis using
-    // hybrid approach, so this path may not be reached. Kept for completeness.
-    wlr_seat_pointer_notify_enter(instance->seat, surface, local_x, local_y);
+    // Flutter-first scroll: Flutter receives scroll from embedder, does hit-testing,
+    // and forwards to the correct surface via this platform channel handler.
+    // NOTE: Don't call notify_enter here - seat already has focus from motion events.
+    //
+    // Use cached original wlroots scroll parameters for accurate Wayland delivery.
+    // This preserves delta_discrete, source, and relative_direction from hardware.
 
-    if (message.scroll_delta_x != 0.0) {
-      wlr_seat_pointer_notify_axis(instance->seat, time_msec, WL_POINTER_AXIS_HORIZONTAL_SCROLL,
-          -message.scroll_delta_x, 0, WL_POINTER_AXIS_SOURCE_WHEEL, 0);
+    if (message.scroll_delta_x != 0.0 && instance->input.last_scroll_x.valid) {
+      struct fwr_scroll_cache *cache = &instance->input.last_scroll_x;
+      wlr_seat_pointer_notify_axis(instance->seat, cache->time_msec, cache->orientation,
+          cache->delta, cache->delta_discrete, cache->source, cache->relative_direction);
+      instance->input.last_scroll_x.valid = false;
     }
-    if (message.scroll_delta_y != 0.0) {
-      wlr_seat_pointer_notify_axis(instance->seat, time_msec, WL_POINTER_AXIS_VERTICAL_SCROLL,
-          -message.scroll_delta_y, 0, WL_POINTER_AXIS_SOURCE_WHEEL, 0);
+    if (message.scroll_delta_y != 0.0 && instance->input.last_scroll_y.valid) {
+      struct fwr_scroll_cache *cache = &instance->input.last_scroll_y;
+      wlr_seat_pointer_notify_axis(instance->seat, cache->time_msec, cache->orientation,
+          cache->delta, cache->delta_discrete, cache->source, cache->relative_direction);
+      instance->input.last_scroll_y.valid = false;
     }
 
     wlr_seat_pointer_notify_frame(instance->seat);
@@ -1145,17 +1168,23 @@ void fwr_handle_popup_pointer_event_message(
     set_surface_buttons(message.surface_handle + 200000, next_buttons);
     wlr_seat_pointer_notify_frame(instance->seat);
   } else if (message.event_type == pointerScrollEvent) {
-    // Note: Scroll events are also sent directly via on_server_cursor_axis using
-    // hybrid approach, so this path may not be reached. Kept for completeness.
-    wlr_seat_pointer_notify_enter(instance->seat, surface, local_x, local_y);
+    // Flutter-first scroll: Flutter receives scroll from embedder, does hit-testing,
+    // and forwards to the correct popup via this platform channel handler.
+    // NOTE: Don't call notify_enter here - seat already has focus from motion events.
+    //
+    // Use cached original wlroots scroll parameters for accurate Wayland delivery.
 
-    if (message.scroll_delta_x != 0.0) {
-      wlr_seat_pointer_notify_axis(instance->seat, time_msec, WL_POINTER_AXIS_HORIZONTAL_SCROLL,
-          -message.scroll_delta_x, 0, WL_POINTER_AXIS_SOURCE_WHEEL, 0);
+    if (message.scroll_delta_x != 0.0 && instance->input.last_scroll_x.valid) {
+      struct fwr_scroll_cache *cache = &instance->input.last_scroll_x;
+      wlr_seat_pointer_notify_axis(instance->seat, cache->time_msec, cache->orientation,
+          cache->delta, cache->delta_discrete, cache->source, cache->relative_direction);
+      instance->input.last_scroll_x.valid = false;
     }
-    if (message.scroll_delta_y != 0.0) {
-      wlr_seat_pointer_notify_axis(instance->seat, time_msec, WL_POINTER_AXIS_VERTICAL_SCROLL,
-          -message.scroll_delta_y, 0, WL_POINTER_AXIS_SOURCE_WHEEL, 0);
+    if (message.scroll_delta_y != 0.0 && instance->input.last_scroll_y.valid) {
+      struct fwr_scroll_cache *cache = &instance->input.last_scroll_y;
+      wlr_seat_pointer_notify_axis(instance->seat, cache->time_msec, cache->orientation,
+          cache->delta, cache->delta_discrete, cache->source, cache->relative_direction);
+      instance->input.last_scroll_y.valid = false;
     }
 
     wlr_seat_pointer_notify_frame(instance->seat);
