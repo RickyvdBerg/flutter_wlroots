@@ -24,9 +24,12 @@
 #include <wlr/util/box.h>
 #include <wlr/types/wlr_scene.h>
 #include <wlr/interfaces/wlr_buffer.h>
+#include <wlr/render/dmabuf.h>
 #include <pixman.h>
+#include <drm_fourcc.h>
 
 #include "EGL/egl.h"
+#include "EGL/eglext.h"
 
 #define GL_BGRA_EXT 0x80E1
 
@@ -270,10 +273,35 @@ void fwr_renderer_init(struct fwr_instance *instance, gl_resolve_fn resolver) {
   fns->glGetBooleanv = (void (*)(GLenum, GLboolean*)) resolver("glGetBooleanv");
   fns->glReadPixels = (void (*)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*)) resolver("glReadPixels");
   fns->glViewport = (void (*)(GLint, GLint, GLsizei, GLsizei)) resolver("glViewport");
+  fns->glIsEnabled = (GLboolean (*)(GLenum)) resolver("glIsEnabled");
 
   const char *egl_exts = eglQueryString(instance->egl_display, EGL_EXTENSIONS);
   bool ext_context_priority = strstr(egl_exts, "EGL_IMG_context_priority") != NULL;
   bool ext_context_robustness = strstr(egl_exts, "EGL_EXT_create_context_robustness") != NULL;
+
+  // Initialize DMA-BUF import support
+  bool ext_image_base = strstr(egl_exts, "EGL_KHR_image_base") != NULL;
+  bool ext_dmabuf_import = strstr(egl_exts, "EGL_EXT_image_dma_buf_import") != NULL;
+  renderer->has_dmabuf_import = ext_image_base && ext_dmabuf_import;
+
+  if (renderer->has_dmabuf_import) {
+    renderer->eglCreateImageKHR = (void *(*)(EGLDisplay, EGLContext, unsigned int, void*, const int*))
+      eglGetProcAddress("eglCreateImageKHR");
+    renderer->eglDestroyImageKHR = (int (*)(EGLDisplay, void*))
+      eglGetProcAddress("eglDestroyImageKHR");
+    renderer->glEGLImageTargetTexture2DOES = (void (*)(GLenum, void*))
+      eglGetProcAddress("glEGLImageTargetTexture2DOES");
+
+    if (!renderer->eglCreateImageKHR || !renderer->eglDestroyImageKHR ||
+        !renderer->glEGLImageTargetTexture2DOES) {
+      wlr_log(WLR_INFO, "DMA-BUF import extensions present but functions not found");
+      renderer->has_dmabuf_import = false;
+    } else {
+      wlr_log(WLR_INFO, "DMA-BUF import enabled for zero-copy texture sharing");
+    }
+  } else {
+    wlr_log(WLR_INFO, "DMA-BUF import not available, using texture copy fallback");
+  }
 
   EGLint client_version = 2;
   eglQueryContext(instance->egl_display, instance->egl_context, EGL_CONTEXT_CLIENT_VERSION, &client_version);
@@ -967,7 +995,16 @@ static void render_scene_layer_platform(struct fwr_instance *instance, struct wl
 
 void fwr_cached_texture_destroy(struct fwr_instance *instance,
                                 struct fwr_cached_texture *cache) {
-  if (cache->tex == 0 && cache->fbo == 0) {
+  // Check if there's anything to clean up
+  bool has_egl_images = false;
+  for (int i = 0; i < FWR_EGLIMAGE_CACHE_SIZE; i++) {
+    if (cache->egl_cache[i].egl_image != NULL) {
+      has_egl_images = true;
+      break;
+    }
+  }
+
+  if (cache->tex == 0 && cache->fbo == 0 && !has_egl_images) {
     return;
   }
 
@@ -979,10 +1016,11 @@ void fwr_cached_texture_destroy(struct fwr_instance *instance,
 
   if (!eglMakeCurrent(instance->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
                       instance->egl_context)) {
-    // If wlroots context also fails, log but still clean up cache fields
     wlr_log(WLR_ERROR, "Failed to bind EGL context for texture cleanup");
   } else {
-    struct gl_fns *fns = &instance->fwr_renderer.fns;
+    struct fwr_renderer *renderer = &instance->fwr_renderer;
+    struct gl_fns *fns = &renderer->fns;
+
     if (cache->tex != 0) {
       fns->glDeleteTextures(1, &cache->tex);
     }
@@ -990,14 +1028,31 @@ void fwr_cached_texture_destroy(struct fwr_instance *instance,
       fns->glDeleteFramebuffers(1, &cache->fbo);
     }
 
+    // Destroy all cached EGLImages
+    if (renderer->eglDestroyImageKHR) {
+      for (int i = 0; i < FWR_EGLIMAGE_CACHE_SIZE; i++) {
+        if (cache->egl_cache[i].egl_image != NULL) {
+          renderer->eglDestroyImageKHR(instance->egl_display, cache->egl_cache[i].egl_image);
+          cache->egl_cache[i].egl_image = NULL;
+          cache->egl_cache[i].buffer = NULL;
+          cache->egl_cache[i].width = 0;
+          cache->egl_cache[i].height = 0;
+        }
+      }
+    }
+
     eglMakeCurrent(instance->egl_display, prev_draw, prev_read, prev_ctx);
   }
 
   cache->tex = 0;
   cache->fbo = 0;
+  cache->current_egl_image = NULL;
+  cache->egl_cache_next = 0;
   cache->width = 0;
   cache->height = 0;
   cache->last_seq = 0;
+  cache->is_external = false;
+  cache->tex_params_set = false;
 }
 
 GLuint fwr_renderer_copy_texture(struct fwr_instance *instance,
@@ -1011,6 +1066,25 @@ GLuint fwr_renderer_copy_texture(struct fwr_instance *instance,
 
   struct fwr_renderer *renderer = &instance->fwr_renderer;
   struct gl_fns *fns = &renderer->fns;
+
+  // Save all GL state we're going to modify - Flutter may have its own state set
+  GLint old_fbo;
+  fns->glGetIntegerv(GL_FRAMEBUFFER_BINDING, &old_fbo);
+
+  GLint old_viewport[4];
+  fns->glGetIntegerv(GL_VIEWPORT, old_viewport);
+
+  GLint old_prog;
+  fns->glGetIntegerv(GL_CURRENT_PROGRAM, &old_prog);
+
+  GLint old_active_texture;
+  fns->glGetIntegerv(GL_ACTIVE_TEXTURE, &old_active_texture);
+
+  GLint old_array_buffer;
+  fns->glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &old_array_buffer);
+
+  GLboolean blend_enabled = fns->glIsEnabled(GL_BLEND);
+  GLboolean scissor_enabled = fns->glIsEnabled(GL_SCISSOR_TEST);
 
   // Check if we need to (re)create texture
   bool need_alloc = (cache->tex == 0) ||
@@ -1051,12 +1125,11 @@ GLuint fwr_renderer_copy_texture(struct fwr_instance *instance,
   GLenum status = fns->glCheckFramebufferStatus(GL_FRAMEBUFFER);
   if (status != GL_FRAMEBUFFER_COMPLETE) {
     wlr_log(WLR_ERROR, "Framebuffer incomplete: 0x%x, tex: %d, fbo: %d, ext: %d", status, cache->tex, cache->fbo, texture);
-    fns->glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    // Restore FBO before returning
+    fns->glBindFramebuffer(GL_FRAMEBUFFER, old_fbo);
     return 0;
   }
 
-  GLint viewport[4];
-  fns->glGetIntegerv(GL_VIEWPORT, viewport);
   fns->glViewport(0, 0, width, height);
 
   // Ensure clean state for alpha preservation
@@ -1068,9 +1141,6 @@ GLuint fwr_renderer_copy_texture(struct fwr_instance *instance,
     fns->glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
     fns->glClear(GL_COLOR_BUFFER_BIT);
   }
-
-  GLint old_prog;
-  fns->glGetIntegerv(GL_CURRENT_PROGRAM, &old_prog);
 
   GLuint prog;
   GLint tex_loc, pos_loc, tex_attrib_loc;
@@ -1113,16 +1183,226 @@ GLuint fwr_renderer_copy_texture(struct fwr_instance *instance,
   fns->glDisableVertexAttribArray(pos_loc);
   fns->glDisableVertexAttribArray(tex_attrib_loc);
 
+  // Restore all GL state
   fns->glUseProgram(old_prog);
-  fns->glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  fns->glBindFramebuffer(GL_FRAMEBUFFER, old_fbo);
   fns->glBindTexture(target, 0);
-  fns->glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+  fns->glActiveTexture(old_active_texture);
+  fns->glBindBuffer(GL_ARRAY_BUFFER, old_array_buffer);
+  fns->glViewport(old_viewport[0], old_viewport[1], old_viewport[2], old_viewport[3]);
+
+  // Restore blend and scissor state
+  if (blend_enabled) {
+    fns->glEnable(GL_BLEND);
+  }
+  if (scissor_enabled) {
+    fns->glEnable(GL_SCISSOR_TEST);
+  }
 
   // wlr_log(WLR_DEBUG, "Copy done. Result tex: %d", cache->tex);
   return cache->tex;
 }
 
+// Helper to find or create an EGLImage for a buffer in the cache
+static void *get_or_create_egl_image(struct fwr_instance *instance,
+                                     struct fwr_cached_texture *cache,
+                                     struct wlr_buffer *buffer,
+                                     struct wlr_dmabuf_attributes *dmabuf_attribs) {
+  struct fwr_renderer *renderer = &instance->fwr_renderer;
+  int target_width = dmabuf_attribs->width;
+  int target_height = dmabuf_attribs->height;
 
+  // Check if we already have an EGLImage for this buffer with matching dimensions
+  for (int i = 0; i < FWR_EGLIMAGE_CACHE_SIZE; i++) {
+    if (cache->egl_cache[i].buffer == buffer && cache->egl_cache[i].egl_image != NULL) {
+      // Validate dimensions match (buffer might be reused at different size after resize)
+      if (cache->egl_cache[i].width == target_width &&
+          cache->egl_cache[i].height == target_height) {
+        return cache->egl_cache[i].egl_image;
+      } else {
+        // Buffer reused with different size - invalidate this cache entry
+        renderer->eglDestroyImageKHR(instance->egl_display, cache->egl_cache[i].egl_image);
+        cache->egl_cache[i].egl_image = NULL;
+        cache->egl_cache[i].buffer = NULL;
+        cache->egl_cache[i].width = 0;
+        cache->egl_cache[i].height = 0;
+      }
+    }
+  }
+
+  // If dimensions changed from what we had cached, clear all cache entries
+  // (resize invalidates the entire buffer pool)
+  if (cache->width != 0 && (cache->width != target_width || cache->height != target_height)) {
+    for (int i = 0; i < FWR_EGLIMAGE_CACHE_SIZE; i++) {
+      if (cache->egl_cache[i].egl_image != NULL) {
+        renderer->eglDestroyImageKHR(instance->egl_display, cache->egl_cache[i].egl_image);
+        cache->egl_cache[i].egl_image = NULL;
+        cache->egl_cache[i].buffer = NULL;
+        cache->egl_cache[i].width = 0;
+        cache->egl_cache[i].height = 0;
+      }
+    }
+    cache->current_egl_image = NULL;
+    cache->tex_params_set = false;  // May need to rebind texture
+  }
+
+  // Need to create a new EGLImage - find a slot
+  int slot = cache->egl_cache_next;
+  cache->egl_cache_next = (cache->egl_cache_next + 1) % FWR_EGLIMAGE_CACHE_SIZE;
+
+  // Destroy old EGLImage in this slot if any
+  if (cache->egl_cache[slot].egl_image != NULL) {
+    renderer->eglDestroyImageKHR(instance->egl_display, cache->egl_cache[slot].egl_image);
+    cache->egl_cache[slot].egl_image = NULL;
+    cache->egl_cache[slot].buffer = NULL;
+  }
+
+  // Build EGLImage attributes for DMA-BUF import
+  unsigned int atti = 0;
+  EGLint attribs[50];
+  attribs[atti++] = EGL_WIDTH;
+  attribs[atti++] = dmabuf_attribs->width;
+  attribs[atti++] = EGL_HEIGHT;
+  attribs[atti++] = dmabuf_attribs->height;
+  attribs[atti++] = EGL_LINUX_DRM_FOURCC_EXT;
+  attribs[atti++] = dmabuf_attribs->format;
+
+  // Define attribute names for each plane
+  struct {
+    EGLint fd;
+    EGLint offset;
+    EGLint pitch;
+    EGLint mod_lo;
+    EGLint mod_hi;
+  } plane_attrs[WLR_DMABUF_MAX_PLANES] = {
+    { EGL_DMA_BUF_PLANE0_FD_EXT, EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+      EGL_DMA_BUF_PLANE0_PITCH_EXT, EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,
+      EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT },
+    { EGL_DMA_BUF_PLANE1_FD_EXT, EGL_DMA_BUF_PLANE1_OFFSET_EXT,
+      EGL_DMA_BUF_PLANE1_PITCH_EXT, EGL_DMA_BUF_PLANE1_MODIFIER_LO_EXT,
+      EGL_DMA_BUF_PLANE1_MODIFIER_HI_EXT },
+    { EGL_DMA_BUF_PLANE2_FD_EXT, EGL_DMA_BUF_PLANE2_OFFSET_EXT,
+      EGL_DMA_BUF_PLANE2_PITCH_EXT, EGL_DMA_BUF_PLANE2_MODIFIER_LO_EXT,
+      EGL_DMA_BUF_PLANE2_MODIFIER_HI_EXT },
+    { EGL_DMA_BUF_PLANE3_FD_EXT, EGL_DMA_BUF_PLANE3_OFFSET_EXT,
+      EGL_DMA_BUF_PLANE3_PITCH_EXT, EGL_DMA_BUF_PLANE3_MODIFIER_LO_EXT,
+      EGL_DMA_BUF_PLANE3_MODIFIER_HI_EXT },
+  };
+
+  for (int i = 0; i < dmabuf_attribs->n_planes; i++) {
+    attribs[atti++] = plane_attrs[i].fd;
+    attribs[atti++] = dmabuf_attribs->fd[i];
+    attribs[atti++] = plane_attrs[i].offset;
+    attribs[atti++] = (EGLint)dmabuf_attribs->offset[i];
+    attribs[atti++] = plane_attrs[i].pitch;
+    attribs[atti++] = (EGLint)dmabuf_attribs->stride[i];
+
+    // Add modifier if not INVALID
+    if (dmabuf_attribs->modifier != DRM_FORMAT_MOD_INVALID) {
+      attribs[atti++] = plane_attrs[i].mod_lo;
+      attribs[atti++] = dmabuf_attribs->modifier & 0xFFFFFFFF;
+      attribs[atti++] = plane_attrs[i].mod_hi;
+      attribs[atti++] = dmabuf_attribs->modifier >> 32;
+    }
+  }
+  attribs[atti++] = EGL_NONE;
+
+  // Create EGLImage from DMA-BUF
+  void *egl_image = renderer->eglCreateImageKHR(
+    instance->egl_display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, attribs);
+
+  if (egl_image == EGL_NO_IMAGE_KHR) {
+    return NULL;
+  }
+
+  // Store in cache with dimensions
+  cache->egl_cache[slot].buffer = buffer;
+  cache->egl_cache[slot].egl_image = egl_image;
+  cache->egl_cache[slot].width = target_width;
+  cache->egl_cache[slot].height = target_height;
+
+  return egl_image;
+}
+
+bool fwr_renderer_import_surface_dmabuf(struct fwr_instance *instance,
+                                        struct wlr_surface *surface,
+                                        struct fwr_cached_texture *cache) {
+  struct fwr_renderer *renderer = &instance->fwr_renderer;
+
+  if (!renderer->has_dmabuf_import) {
+    return false;
+  }
+
+  // Get the client buffer from the surface
+  struct wlr_client_buffer *client_buffer = surface->buffer;
+  if (client_buffer == NULL || client_buffer->source == NULL) {
+    return false;
+  }
+
+  struct wlr_buffer *source_buffer = client_buffer->source;
+
+  // Try to get DMA-BUF attributes from the source buffer
+  struct wlr_dmabuf_attributes dmabuf_attribs;
+  if (!wlr_buffer_get_dmabuf(source_buffer, &dmabuf_attribs)) {
+    // Not a DMA-BUF, fall back to copy path
+    return false;
+  }
+
+  // Check if we can reuse the existing texture (same sequence = same content)
+  uint32_t current_seq = surface->current.seq;
+  if (cache->tex != 0 && cache->last_seq == current_seq &&
+      cache->width == dmabuf_attribs.width &&
+      cache->height == dmabuf_attribs.height) {
+    // Content unchanged - reuse existing texture
+    return true;
+  }
+
+  // Get or create EGLImage for this buffer (cached for triple-buffering)
+  void *egl_image = get_or_create_egl_image(instance, cache, source_buffer, &dmabuf_attribs);
+  if (egl_image == NULL) {
+    wlr_log(WLR_DEBUG, "Failed to create EGLImage from DMA-BUF (format=0x%x, mod=0x%lx)",
+            dmabuf_attribs.format, dmabuf_attribs.modifier);
+    return false;
+  }
+
+  // Note: We don't lock the buffer here. The EGLImage keeps the DMA-BUF memory
+  // alive via the file descriptors. Locking would prevent the client from
+  // recycling buffers in its swapchain, causing "No free output buffer slot" errors.
+
+  // Create GL texture if needed
+  struct gl_fns *fns = &renderer->fns;
+  if (cache->tex == 0) {
+    fns->glGenTextures(1, &cache->tex);
+  }
+
+  // For DMA-BUF imports, we typically need GL_TEXTURE_EXTERNAL_OES
+  GLenum target = GL_TEXTURE_EXTERNAL_OES;
+  cache->is_external = true;
+
+  // Bind EGLImage to texture (only if it changed)
+  if (cache->current_egl_image != egl_image) {
+    fns->glBindTexture(target, cache->tex);
+    renderer->glEGLImageTargetTexture2DOES(target, egl_image);
+
+    // Only set texture parameters once per texture
+    if (!cache->tex_params_set) {
+      fns->glTexParameteri(target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+      fns->glTexParameteri(target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+      fns->glTexParameteri(target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+      fns->glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+      cache->tex_params_set = true;
+    }
+
+    fns->glBindTexture(target, 0);
+    cache->current_egl_image = egl_image;
+  }
+
+  cache->width = dmabuf_attribs.width;
+  cache->height = dmabuf_attribs.height;
+  cache->last_seq = current_seq;
+
+  return true;
+}
 
 static void render_scene_layer_texture(struct fwr_instance *instance, struct wlr_render_pass *render_pass, struct fwr_renderer_scene_layer *layer) {
   struct fwr_renderer *renderer = &instance->fwr_renderer;

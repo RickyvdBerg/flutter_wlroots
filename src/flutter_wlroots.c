@@ -207,23 +207,38 @@ static bool provide_surface_texture(struct fwr_instance *instance,
                                     struct wlr_surface *surface,
                                     struct fwr_cached_texture *cache,
                                     FlutterOpenGLTexture *texture_out) {
+#ifndef GL_RGBA8
+#define GL_RGBA8 0x8058
+#endif
+#ifndef GL_TEXTURE_EXTERNAL_OES
+#define GL_TEXTURE_EXTERNAL_OES 0x8D65
+#endif
+
+  // Try DMA-BUF zero-copy import first (preferred path)
+  if (fwr_renderer_import_surface_dmabuf(instance, surface, cache)) {
+    texture_out->target = cache->is_external ? GL_TEXTURE_EXTERNAL_OES : GL_TEXTURE_2D;
+    texture_out->name = cache->tex;
+    texture_out->format = GL_RGBA8;
+    texture_out->user_data = NULL;
+    texture_out->destruction_callback = NULL;
+    texture_out->width = cache->width;
+    texture_out->height = cache->height;
+    return true;
+  }
+
+  // Fall back to texture copy path
   struct wlr_texture *wlr_tex = wlr_surface_get_texture(surface);
   if (wlr_tex == NULL) {
     return false;
   }
 
-#ifndef GL_RGBA8
-#define GL_RGBA8 0x8058
-#endif
-
   // Check if content changed since last copy (optimization: skip copy if unchanged)
   uint32_t current_seq = surface->current.seq;
   if (cache->tex != 0 && cache->last_seq == current_seq &&
       cache->width == surface->current.width &&
-      cache->height == surface->current.height) {
+      cache->height == surface->current.height &&
+      cache->current_egl_image == NULL) {  // Make sure we're not mixing DMA-BUF and copy paths
     // Content unchanged - reuse cached texture
-    wlr_log(WLR_DEBUG, "provide_surface_texture CACHED: tex=%d, seq=%u, size=%dx%d",
-            cache->tex, current_seq, cache->width, cache->height);
     texture_out->target = GL_TEXTURE_2D;
     texture_out->name = cache->tex;
     texture_out->format = GL_RGBA8;
@@ -236,10 +251,6 @@ static bool provide_surface_texture(struct fwr_instance *instance,
 
   struct wlr_gles2_texture_attribs attribs;
   wlr_gles2_texture_get_attribs(wlr_tex, &attribs);
-
-  wlr_log(WLR_DEBUG, "provide_surface_texture: surface=%dx%d, tex=%d, target=0x%x, seq=%u",
-          surface->current.width, surface->current.height,
-          attribs.tex, attribs.target, current_seq);
 
   // Copy texture to ensure Flutter compatibility
   GLuint tex_2d = fwr_renderer_copy_texture(instance, attribs.tex, attribs.target,

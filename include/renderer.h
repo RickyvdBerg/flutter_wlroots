@@ -71,6 +71,7 @@ struct gl_fns {
   void (*glGetIntegerv)(GLenum, GLint*);
   void (*glReadPixels)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*);
   void (*glViewport)(GLint, GLint, GLsizei, GLsizei);
+  GLboolean (*glIsEnabled)(GLenum);
 };
 
 struct fwr_renderer_fbo {
@@ -154,6 +155,12 @@ struct fwr_renderer {
   EGLContext flutter_egl_context;
   EGLContext flutter_resource_egl_context;
 
+  // EGL DMA-BUF import functions
+  void *(*eglCreateImageKHR)(EGLDisplay, EGLContext, unsigned int, void*, const int*);
+  int (*eglDestroyImageKHR)(EGLDisplay, void*);
+  void (*glEGLImageTargetTexture2DOES)(GLenum, void*);
+  bool has_dmabuf_import;
+
   pthread_mutex_t render_mutex;
 };
 
@@ -176,3 +183,11 @@ GLuint fwr_renderer_copy_texture(struct fwr_instance *instance,
                                  GLuint texture, GLenum target,
                                  int width, int height,
                                  struct fwr_cached_texture *cache);
+
+// Import a surface's DMA-BUF into a GL texture for Flutter
+// Returns the GL texture ID, or 0 on failure
+// Sets cache->is_external if the texture must use GL_TEXTURE_EXTERNAL_OES
+struct wlr_surface;
+bool fwr_renderer_import_surface_dmabuf(struct fwr_instance *instance,
+                                        struct wlr_surface *surface,
+                                        struct fwr_cached_texture *cache);

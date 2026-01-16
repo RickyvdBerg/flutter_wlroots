@@ -24,13 +24,29 @@ struct wlr_scene_tree;
 struct wlr_scene_rect;
 struct wlr_output_layout_output;
 
-// Cached texture for zero-copy or copy-based texture sharing
+// EGLImage cache entry for triple-buffered DMA-BUF surfaces
+#define FWR_EGLIMAGE_CACHE_SIZE 4
+struct fwr_eglimage_cache_entry {
+  struct wlr_buffer *buffer;  // Source buffer (key)
+  void *egl_image;            // EGLImageKHR
+  int width;                  // Buffer dimensions (for invalidation on resize)
+  int height;
+};
+
+// Cached texture for zero-copy DMA-BUF texture sharing
 struct fwr_cached_texture {
   GLuint tex;
-  GLuint fbo;
+  GLuint fbo;           // Only used for fallback copy path
   int width;
   int height;
-  uint32_t last_seq;  // Surface commit sequence - skip copy if unchanged
+  uint32_t last_seq;    // Surface commit sequence - skip reimport if unchanged
+  bool is_external;     // True if texture requires GL_TEXTURE_EXTERNAL_OES
+  bool tex_params_set;  // True if texture parameters have been configured
+
+  // EGLImage cache for triple-buffering (avoids recreating EGLImage every frame)
+  struct fwr_eglimage_cache_entry egl_cache[FWR_EGLIMAGE_CACHE_SIZE];
+  int egl_cache_next;   // Next slot to use (round-robin)
+  void *current_egl_image;  // Currently bound EGLImage
 };
 
 struct fwr_instance {
