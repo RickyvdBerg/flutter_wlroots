@@ -39,6 +39,13 @@ struct fwr_scroll_cache {
     bool valid;
 };
 
+// Cache for original wlroots button event timestamp.
+// Wayland clients expect timestamps from the hardware clock, not Flutter's clock.
+struct fwr_button_cache {
+    uint32_t time_msec;
+    bool valid;
+};
+
 struct fwr_input_state {
     uint32_t mouse_button_mask;
     uint32_t fl_mouse_button_mask;
@@ -62,6 +69,9 @@ struct fwr_input_state {
     // Stores original wlroots parameters to pass through platform channel
     struct fwr_scroll_cache last_scroll_x;
     struct fwr_scroll_cache last_scroll_y;
+
+    // Cached button event timestamp for Flutter-first path
+    struct fwr_button_cache last_button;
 
     struct fwr_grab_state grab;
 };

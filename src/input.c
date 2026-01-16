@@ -239,6 +239,14 @@ static void on_server_cursor_button(struct wl_listener *listener, void *data) {
 
   // Flutter-first: Send all button events to Flutter
   // Flutter's widget tree does hit testing and forwards to surfaces as needed
+  //
+  // Cache the original wlroots timestamp so we can use it when the platform
+  // channel response arrives. Wayland clients expect hardware timestamps.
+  instance->input.last_button = (struct fwr_button_cache){
+    .time_msec = event->time_msec,
+    .valid = true,
+  };
+
   send_flutter_mouse_event(instance,
     event->state == WL_POINTER_BUTTON_STATE_PRESSED ? kDown : kUp,
     kFlutterPointerSignalKindNone, 0.0, 0.0);
@@ -1008,6 +1016,13 @@ void fwr_handle_surface_pointer_event_message(
       wlr_scene_node_raise_to_top(&view->scene_tree->node);
     }
 
+    // Use cached wlroots timestamp for accurate Wayland timing
+    // (Flutter's timestamp is from a different clock)
+    uint32_t button_time = instance->input.last_button.valid
+        ? instance->input.last_button.time_msec
+        : time_msec;  // Fallback to Flutter timestamp if no cache
+    instance->input.last_button.valid = false;
+
     // Track button state by surface handle (more reliable than pointer ID which can change)
     int64_t prev_buttons = get_surface_buttons(message.surface_handle);
     int64_t next_buttons = message.buttons;
@@ -1034,7 +1049,7 @@ void fwr_handle_surface_pointer_event_message(
 
       enum wl_pointer_button_state state =
           (next_buttons & flutter_button) ? WL_POINTER_BUTTON_STATE_PRESSED : WL_POINTER_BUTTON_STATE_RELEASED;
-      wlr_seat_pointer_notify_button(instance->seat, time_msec, linux_button, state);
+      wlr_seat_pointer_notify_button(instance->seat, button_time, linux_button, state);
     }
 
     set_surface_buttons(message.surface_handle, next_buttons);
@@ -1149,6 +1164,12 @@ void fwr_handle_popup_pointer_event_message(
         kFlutterPointerButtonMouseForward,
     };
 
+    // Use cached button timestamp for accurate Wayland delivery
+    uint32_t button_time = instance->input.last_button.valid
+        ? instance->input.last_button.time_msec
+        : time_msec;
+    instance->input.last_button.valid = false;
+
     for (size_t i = 0; i < sizeof(flutter_buttons) / sizeof(flutter_buttons[0]); i++) {
       int64_t flutter_button = flutter_buttons[i];
       if ((changed & flutter_button) == 0) {
@@ -1162,7 +1183,7 @@ void fwr_handle_popup_pointer_event_message(
 
       enum wl_pointer_button_state state =
           (next_buttons & flutter_button) ? WL_POINTER_BUTTON_STATE_PRESSED : WL_POINTER_BUTTON_STATE_RELEASED;
-      wlr_seat_pointer_notify_button(instance->seat, time_msec, linux_button, state);
+      wlr_seat_pointer_notify_button(instance->seat, button_time, linux_button, state);
     }
 
     set_surface_buttons(message.surface_handle + 200000, next_buttons);
