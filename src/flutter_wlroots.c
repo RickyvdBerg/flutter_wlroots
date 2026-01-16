@@ -222,6 +222,8 @@ static bool provide_surface_texture(struct fwr_instance *instance,
       cache->width == surface->current.width &&
       cache->height == surface->current.height) {
     // Content unchanged - reuse cached texture
+    wlr_log(WLR_DEBUG, "provide_surface_texture CACHED: tex=%d, seq=%u, size=%dx%d",
+            cache->tex, current_seq, cache->width, cache->height);
     texture_out->target = GL_TEXTURE_2D;
     texture_out->name = cache->tex;
     texture_out->format = GL_RGBA8;
