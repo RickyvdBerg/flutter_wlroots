@@ -16,6 +16,7 @@
 
 #include "surface.h"
 #include "messages.h"
+#include "output.h"
 
 // Forward declarations for subsurface handling
 static void handle_new_subsurface(struct wl_listener *listener, void *data);
@@ -215,6 +216,16 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
   wlr_log(WLR_INFO, "Geometry: buffer offset=(%d,%d), visible size=%dx%d",
           view->geo_x, view->geo_y, view->width, view->height);
 
+  // Initialize output tracking for multi-monitor support
+  view->current_output = fwr_output_for_box(instance,
+      view->x, view->y, view->width, view->height);
+  view->output_scale = view->current_output ? view->current_output->wlr_output->scale : 1.0;
+
+  wlr_log(WLR_INFO, "View %d initial output: %s (scale=%.2f)",
+          view->handle,
+          view->current_output ? view->current_output->wlr_output->name : "none",
+          view->output_scale);
+
   view->texture_id = (int64_t)view->handle;
   FlutterEngineResult result = instance->fl_proc_table.RegisterExternalTexture(
       instance->engine, view->texture_id);
@@ -247,7 +258,7 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
 
   msg_seg = message_builder_segment(&msg);
   struct message_builder_segment arg_seg =
-      message_builder_segment_push_map(&msg_seg, 18);
+      message_builder_segment_push_map(&msg_seg, 20);  // Increased from 18 for output info
   message_builder_segment_push_string(&arg_seg, "handle");
   wlr_log(WLR_INFO, "viewhandle %d", view->handle);
   message_builder_segment_push_int64(&arg_seg, view->handle);
@@ -289,6 +300,11 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
   message_builder_segment_push_int64(&arg_seg, view->activated ? 1 : 0);
   message_builder_segment_push_string(&arg_seg, "uses_csd");
   message_builder_segment_push_int64(&arg_seg, uses_csd ? 1 : 0);
+  // Multi-monitor output info
+  message_builder_segment_push_string(&arg_seg, "output_id");
+  message_builder_segment_push_int64(&arg_seg, view->current_output ? view->current_output->id : 0);
+  message_builder_segment_push_string(&arg_seg, "output_scale");
+  message_builder_segment_push_float64(&arg_seg, view->output_scale);
   message_builder_segment_finish(&arg_seg);
 
   message_builder_segment_finish(&msg_seg);
@@ -446,6 +462,7 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
   if (geo_changed) {
     send_surface_geometry(view);
   }
+
 }
 
 static void xdg_toplevel_destroy(struct wl_listener *listener, void *data) {
@@ -835,11 +852,49 @@ void fwr_handle_surface_set_position(
   view->x = (int)message.x;
   view->y = (int)message.y;
 
+  // Update output tracking for multi-monitor scale
+  struct fwr_output *new_output = fwr_output_for_box(instance,
+      view->x, view->y, view->width, view->height);
+
+  if (view->current_output != new_output) {
+    view->current_output = new_output;
+    view->output_scale = new_output ? new_output->wlr_output->scale : 1.0;
+
+    // Also update child subsurfaces
+    struct fwr_subsurface *sub;
+    wl_list_for_each(sub, &view->subsurfaces, link) {
+      sub->current_output = new_output;
+      sub->output_scale = view->output_scale;
+    }
+
+    // Also update child popups (stored in instance->popups map)
+    struct handle_map_iter *iter = handle_map_iter_new(instance->popups);
+    uint32_t popup_handle;
+    void *popup_value;
+    while (handle_map_iter_next(iter, &popup_handle, &popup_value)) {
+      struct fwr_popup *popup = (struct fwr_popup *)popup_value;
+      if (popup != NULL && popup->parent_view == view) {
+        popup->current_output = new_output;
+        popup->output_scale = view->output_scale;
+        wlr_log(WLR_DEBUG, "Popup %d output updated to %s (parent view %d moved)",
+                popup->handle,
+                new_output ? new_output->wlr_output->name : "none",
+                view->handle);
+      }
+    }
+    handle_map_iter_destroy(iter);
+
+    wlr_log(WLR_DEBUG, "View %d output changed: %s (scale=%.2f)",
+            view->handle,
+            new_output ? new_output->wlr_output->name : "none",
+            view->output_scale);
+  }
+
   // Update scene tree position for input hit-testing
   // For SSD windows, the surface content is offset by the titlebar height
   // Note: wlr_scene_xdg_surface handles geometry offset internally
   if (view->scene_tree != NULL) {
-    int titlebar_offset = view->uses_ssd ? 38 : 0;
+    int titlebar_offset = view->uses_ssd ? FWR_SSD_TITLEBAR_HEIGHT : 0;
     wlr_scene_node_set_position(&view->scene_tree->node, view->x, view->y + titlebar_offset);
   }
 
@@ -849,6 +904,113 @@ success:
 
 error:
   wlr_log(WLR_ERROR, "Invalid surface set position message");
+  instance->fl_proc_table.SendPlatformMessageResponse(instance->engine, handle, NULL, 0);
+}
+
+// ============================================================================
+// Synchronized Resize Support (currently unused - for future FFI implementation)
+// ============================================================================
+
+// Handle synchronized resize request from Dart
+// This requests a specific size and waits for the client to commit a matching buffer
+void fwr_handle_surface_request_resize(
+    struct fwr_instance *instance,
+    const FlutterPlatformMessageResponseHandle *handle,
+    struct dart_value *args) {
+
+  // Decode: [handle, width, height, request_id]
+  if (args->type != dvList || args->list.length < 4) {
+    goto error;
+  }
+
+  uint32_t surface_handle = 0;
+  int width = 0, height = 0;
+  uint64_t request_id = 0;
+
+  if (args->list.values[0].type == dvInteger) {
+    surface_handle = (uint32_t)args->list.values[0].integer;
+  }
+  if (args->list.values[1].type == dvInteger) {
+    width = (int)args->list.values[1].integer;
+  }
+  if (args->list.values[2].type == dvInteger) {
+    height = (int)args->list.values[2].integer;
+  }
+  if (args->list.values[3].type == dvInteger) {
+    request_id = (uint64_t)args->list.values[3].integer;
+  }
+
+  struct fwr_view *view;
+  if (!handle_map_get(instance->views, surface_handle, (void**)&view)) {
+    goto success;  // Surface may have been destroyed
+  }
+
+  wlr_log(WLR_INFO, "Request resize: handle=%d, size=%dx%d, request_id=%lu",
+          surface_handle, width, height, request_id);
+
+  // Store pending resize state
+  view->resize_in_progress = true;
+  view->pending_width = width;
+  view->pending_height = height;
+  view->resize_request_id = request_id;
+
+  // Tell the client it's being resized (affects some client behavior)
+  if (view->xdg_surface->role == WLR_XDG_SURFACE_ROLE_TOPLEVEL) {
+    wlr_xdg_toplevel_set_resizing(view->toplevel, true);
+  }
+
+  // Send configure with new size
+  wlr_xdg_toplevel_set_size(view->toplevel, width, height);
+
+success:
+  instance->fl_proc_table.SendPlatformMessageResponse(instance->engine, handle, method_call_null_success, sizeof(method_call_null_success));
+  return;
+
+error:
+  wlr_log(WLR_ERROR, "Invalid surface_request_resize message");
+  instance->fl_proc_table.SendPlatformMessageResponse(instance->engine, handle, NULL, 0);
+}
+
+// Handle end of resize operation from Dart
+void fwr_handle_surface_end_resize(
+    struct fwr_instance *instance,
+    const FlutterPlatformMessageResponseHandle *handle,
+    struct dart_value *args) {
+
+  // Decode: [handle]
+  if (args->type != dvList || args->list.length < 1) {
+    goto error;
+  }
+
+  uint32_t surface_handle = 0;
+  if (args->list.values[0].type == dvInteger) {
+    surface_handle = (uint32_t)args->list.values[0].integer;
+  }
+
+  struct fwr_view *view;
+  if (!handle_map_get(instance->views, surface_handle, (void**)&view)) {
+    goto success;  // Surface may have been destroyed
+  }
+
+  wlr_log(WLR_INFO, "End resize: handle=%d", surface_handle);
+
+  // Clear resize state
+  view->resize_in_progress = false;
+  view->pending_width = 0;
+  view->pending_height = 0;
+  view->resize_request_id = 0;
+
+  // Tell the client resize is done
+  if (view->xdg_surface->role == WLR_XDG_SURFACE_ROLE_TOPLEVEL) {
+    wlr_xdg_toplevel_set_resizing(view->toplevel, false);
+  }
+
+success:
+  instance->fl_proc_table.SendPlatformMessageResponse(instance->engine, handle, method_call_null_success, sizeof(method_call_null_success));
+  return;
+
+error:
+  wlr_log(WLR_ERROR, "Invalid surface_end_resize message");
   instance->fl_proc_table.SendPlatformMessageResponse(instance->engine, handle, NULL, 0);
 }
 
@@ -1135,20 +1297,53 @@ static void send_popup_map(struct fwr_popup *popup) {
     geo = popup->xdg_popup->scheduled.geometry;
   }
 
-  // Use surface dimensions if geometry dimensions are 0
-  int width = geo.width > 0 ? geo.width : popup->xdg_surface->surface->current.width;
-  int height = geo.height > 0 ? geo.height : popup->xdg_surface->surface->current.height;
+  // Check for subsurfaces - Firefox/browsers render popup content to subsurfaces
+  // The actual texture dimensions come from the content surface
+  struct wlr_surface *surf = popup->xdg_surface->surface;
+  struct wlr_surface *content_surface = surf;
+  struct wlr_subsurface *first_subsurface = NULL;
+  struct wlr_subsurface *subsurface;
+  wl_list_for_each(subsurface, &surf->current.subsurfaces_below, current.link) {
+    if (subsurface->surface != NULL && subsurface->surface->mapped) {
+      first_subsurface = subsurface;
+      break;
+    }
+  }
+  if (first_subsurface == NULL) {
+    wl_list_for_each(subsurface, &surf->current.subsurfaces_above, current.link) {
+      if (subsurface->surface != NULL && subsurface->surface->mapped) {
+        first_subsurface = subsurface;
+        break;
+      }
+    }
+  }
+  if (first_subsurface != NULL) {
+    content_surface = first_subsurface->surface;
+  }
+
+  // Use the actual content surface dimensions to match the texture
+  // This prevents stretching when Flutter renders the popup
+  int width = content_surface->current.width;
+  int height = content_surface->current.height;
+
+  // Fall back to geometry if content surface has no size yet
+  if (width == 0 || height == 0) {
+    width = geo.width > 0 ? geo.width : surf->current.width;
+    height = geo.height > 0 ? geo.height : surf->current.height;
+  }
 
   popup->x = geo.x;
   popup->y = geo.y;
   popup->width = width;
   popup->height = height;
 
-  wlr_log(WLR_INFO, "Popup map: handle=%d, parent=%d, pos=(%d,%d), size=%dx%d, surface=%dx%d",
+  wlr_log(WLR_INFO, "Popup map: handle=%d, parent=%d, pos=(%d,%d), size=%dx%d, surface=%dx%d (buf_scale=%d), content=%dx%d (buf_scale=%d), output=%s, scale=%.2f",
           popup->handle, popup->parent_view_handle, popup->x, popup->y,
           popup->width, popup->height,
-          popup->xdg_surface->surface->current.width,
-          popup->xdg_surface->surface->current.height);
+          surf->current.width, surf->current.height, surf->current.scale,
+          content_surface->current.width, content_surface->current.height, content_surface->current.scale,
+          popup->current_output ? popup->current_output->wlr_output->name : "none",
+          popup->output_scale);
 
   struct message_builder msg = message_builder_new();
   struct message_builder_segment msg_seg = message_builder_segment(&msg);
@@ -1157,7 +1352,7 @@ static void send_popup_map(struct fwr_popup *popup) {
 
   msg_seg = message_builder_segment(&msg);
   struct message_builder_segment arg_seg =
-      message_builder_segment_push_map(&msg_seg, 7);
+      message_builder_segment_push_map(&msg_seg, 9);  // Increased from 7 for output info
   message_builder_segment_push_string(&arg_seg, "handle");
   message_builder_segment_push_int64(&arg_seg, popup->handle);
   message_builder_segment_push_string(&arg_seg, "parent_handle");
@@ -1172,6 +1367,11 @@ static void send_popup_map(struct fwr_popup *popup) {
   message_builder_segment_push_int64(&arg_seg, popup->height);
   message_builder_segment_push_string(&arg_seg, "texture_id");
   message_builder_segment_push_int64(&arg_seg, popup->texture_id);
+  // Multi-monitor output info
+  message_builder_segment_push_string(&arg_seg, "output_id");
+  message_builder_segment_push_int64(&arg_seg, popup->current_output ? popup->current_output->id : 0);
+  message_builder_segment_push_string(&arg_seg, "output_scale");
+  message_builder_segment_push_float64(&arg_seg, popup->output_scale);
   message_builder_segment_finish(&arg_seg);
 
   message_builder_segment_finish(&msg_seg);
@@ -1317,21 +1517,72 @@ static void popup_handle_commit(struct wl_listener *listener, void *data) {
           popup->xdg_surface->surface->current.height);
 
   // Unconstrain on first commit (when surface is initialized)
+  // Use parent's output bounds for popup constraint (multi-monitor fix)
   if (!popup->unconstrained) {
     struct wlr_box output_box = {0};
-    if (instance->output != NULL && instance->output->wlr_output != NULL) {
-      output_box.width = instance->output->wlr_output->width;
-      output_box.height = instance->output->wlr_output->height;
+
+    // Use parent's output for constraint, not total layout
+    struct fwr_output *output = popup->parent_view->current_output;
+
+    // Diagnostic: capture parent view state at constraint time
+    wlr_log(WLR_INFO, "Popup %d constraint calc: parent_view=%d, parent_pos=(%d,%d), parent_output=%s",
+            popup->handle, popup->parent_view->handle,
+            popup->parent_view->x, popup->parent_view->y,
+            output ? output->wlr_output->name : "NULL");
+
+    // If parent doesn't have output tracking yet, compute it now based on position
+    if (output == NULL) {
+      output = fwr_output_for_box(instance,
+          popup->parent_view->x, popup->parent_view->y,
+          popup->parent_view->width, popup->parent_view->height);
+      if (output != NULL) {
+        // Update parent view's output tracking while we're at it
+        popup->parent_view->current_output = output;
+        popup->parent_view->output_scale = output->wlr_output->scale;
+        wlr_log(WLR_INFO, "Popup %d: computed parent output from position: %s",
+                popup->handle, output->wlr_output->name);
+      }
+    }
+
+    // If still no output, fall back to first output (not total layout!)
+    if (output == NULL) {
+      output = fwr_get_first_output(instance);
+      if (output != NULL) {
+        wlr_log(WLR_INFO, "Popup %d: using first output as fallback: %s",
+                popup->handle, output->wlr_output->name);
+      }
+    }
+
+    if (output != NULL && output->wlr_output != NULL) {
+      wlr_output_layout_get_box(instance->output_layout,
+                                 output->wlr_output, &output_box);
+      wlr_log(WLR_INFO, "Popup %d using output '%s': raw_box=(%d,%d,%dx%d)",
+              popup->handle, output->wlr_output->name,
+              output_box.x, output_box.y, output_box.width, output_box.height);
+
+      // Update popup's output tracking
+      popup->current_output = output;
+      popup->output_scale = output->wlr_output->scale;
     } else {
+      // Last resort: use total layout (should not happen in practice)
+      wlr_output_layout_get_box(instance->output_layout, NULL, &output_box);
+      wlr_log(WLR_ERROR, "Popup %d: no outputs available! Using TOTAL LAYOUT: raw_box=(%d,%d,%dx%d)",
+              popup->handle, output_box.x, output_box.y, output_box.width, output_box.height);
+    }
+
+    if (output_box.width <= 0 || output_box.height <= 0) {
       output_box.width = 1920;
       output_box.height = 1080;
     }
-    output_box.x = -popup->parent_view->x;
-    output_box.y = -popup->parent_view->y;
+    // Offset by parent position to get relative constraint box
+    int raw_x = output_box.x, raw_y = output_box.y;
+    output_box.x = output_box.x - popup->parent_view->x;
+    output_box.y = output_box.y - popup->parent_view->y;
     wlr_xdg_popup_unconstrain_from_box(popup->xdg_popup, &output_box);
     popup->unconstrained = true;
-    wlr_log(WLR_INFO, "Unconstrained popup %d with box: (%d,%d,%dx%d)",
-            popup->handle, output_box.x, output_box.y, output_box.width, output_box.height);
+    wlr_log(WLR_INFO, "Popup %d unconstrained: offset=(%d-%d, %d-%d), final_box=(%d,%d,%dx%d)",
+            popup->handle, raw_x, popup->parent_view->x, raw_y, popup->parent_view->y,
+            output_box.x, output_box.y, output_box.width, output_box.height);
   }
 
   if (!popup->xdg_surface->surface->mapped) {
@@ -1351,6 +1602,45 @@ static void popup_handle_commit(struct wl_listener *listener, void *data) {
       send_popup_map(popup);
     } else {
       wlr_log(WLR_ERROR, "Failed to register popup texture via commit fallback");
+    }
+  }
+
+  // Check if content dimensions changed - this can happen after unconstrain
+  // when the client resizes the popup content. We need to notify Flutter.
+  if (popup->texture_registered) {
+    struct wlr_surface *surf = popup->xdg_surface->surface;
+    struct wlr_surface *content_surface = surf;
+
+    // Check for subsurfaces (Firefox uses these for popup content)
+    struct wlr_subsurface *first_subsurface = NULL;
+    struct wlr_subsurface *subsurface;
+    wl_list_for_each(subsurface, &surf->current.subsurfaces_below, current.link) {
+      if (subsurface->surface != NULL && subsurface->surface->mapped) {
+        first_subsurface = subsurface;
+        break;
+      }
+    }
+    if (first_subsurface == NULL) {
+      wl_list_for_each(subsurface, &surf->current.subsurfaces_above, current.link) {
+        if (subsurface->surface != NULL && subsurface->surface->mapped) {
+          first_subsurface = subsurface;
+          break;
+        }
+      }
+    }
+    if (first_subsurface != NULL) {
+      content_surface = first_subsurface->surface;
+    }
+
+    int new_width = content_surface->current.width;
+    int new_height = content_surface->current.height;
+
+    // If dimensions changed, notify Flutter with updated size
+    if (new_width > 0 && new_height > 0 &&
+        (new_width != popup->width || new_height != popup->height)) {
+      wlr_log(WLR_INFO, "Popup %d content dimensions changed: %dx%d -> %dx%d, re-sending popup_map",
+              popup->handle, popup->width, popup->height, new_width, new_height);
+      send_popup_map(popup);  // This will update popup->width/height
     }
   }
 
@@ -1427,11 +1717,17 @@ void fwr_new_xdg_popup(struct wl_listener *listener, void *data) {
   popup->width = geo.width;
   popup->height = geo.height;
 
+  // Inherit output from parent view for multi-monitor support
+  popup->current_output = parent_view->current_output;
+  popup->output_scale = parent_view->output_scale;
+
   popup->handle = handle_map_add(instance->popups, (void *)popup);
 
-  wlr_log(WLR_INFO, "Created popup: handle=%d, parent=%d, geo=(%d,%d,%dx%d)",
+  wlr_log(WLR_INFO, "Created popup: handle=%d, parent=%d, geo=(%d,%d,%dx%d), output=%s, scale=%.2f",
           popup->handle, parent_view->handle, popup->x, popup->y,
-          popup->width, popup->height);
+          popup->width, popup->height,
+          popup->current_output ? popup->current_output->wlr_output->name : "none",
+          popup->output_scale);
 
   // Create popup scene tree as child of parent's scene tree (like tinywl)
   // This way popup positioning is automatic - relative to parent

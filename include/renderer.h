@@ -174,7 +174,15 @@ void fwr_renderer_init(struct fwr_instance *instance, gl_resolve_fn resolver);
 //GLuint fwr_renderer_get_active_fbo(struct fwr_instance *instance);
 //void fwr_renderer_flip_fbo(struct fwr_instance *instance);
 
-void fwr_renderer_render_scene(struct fwr_instance *instance, struct wlr_render_pass *render_pass);
+// Output viewport for multi-monitor rendering
+struct fwr_output_viewport {
+  int x;       // Output position in layout
+  int y;
+  int width;   // Output size
+  int height;
+};
+
+void fwr_renderer_render_scene(struct fwr_instance *instance, struct wlr_render_pass *render_pass, struct fwr_output_viewport *viewport);
 void fwr_renderer_update_scene_positions(struct fwr_instance *instance);
 
 void fwr_cached_texture_destroy(struct fwr_instance *instance,

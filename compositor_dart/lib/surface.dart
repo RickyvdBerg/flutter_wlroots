@@ -178,8 +178,10 @@ class _SurfaceViewState extends State<SurfaceView> {
   }
 
   void _onPointerDown(PointerDownEvent event) {
-    // Focus the surface when clicked
-    Compositor.compositor.platform.surfaceFocus(widget.surface);
+    // NOTE: Focus is now handled by WindowManager via WindowFrame.
+    // This avoids race conditions between C-side focus and Dart-side state.
+    // The WindowFrame wraps all content with a Listener that calls
+    // manager.activate() on pointer down.
     controller.dispatchPointerEvent(event);
   }
 
@@ -235,10 +237,21 @@ class _SurfaceViewState extends State<SurfaceView> {
   }
 
   /// Builds the surface tree with toplevel + all subsurfaces as a Stack.
+  /// The Texture widget expands to fill its container and Flutter stretches
+  /// the GL texture to fill that rect. This provides smooth resize - content
+  /// stretches until the client commits a new buffer at the correct size.
   Widget _buildSurfaceTree() {
     final surface = widget.surface;
 
-    Widget mainTexture = Texture(textureId: surface.textureId);
+    // SizedBox.expand makes the texture fill its parent container.
+    // Flutter's texture rendering stretches the GL texture to fill this rect.
+    // filterQuality.medium provides smooth bilinear interpolation during scaling.
+    Widget mainTexture = SizedBox.expand(
+      child: Texture(
+        textureId: surface.textureId,
+        filterQuality: FilterQuality.medium,
+      ),
+    );
 
     if (_subsurfaces.isEmpty) {
       return mainTexture;
@@ -305,7 +318,11 @@ class _PopupViewState extends State<PopupView> {
       onPointerCancel: _controller.dispatchPointerEvent,
       onPointerSignal: _onPointerSignal,
       behavior: HitTestBehavior.opaque,
-      child: Texture(textureId: widget.popup.textureId),
+      child: Texture(
+        textureId: widget.popup.textureId,
+        // Use medium filter quality for better popup rendering when scaled
+        filterQuality: FilterQuality.medium,
+      ),
     );
   }
 }
@@ -317,8 +334,10 @@ class _CompositorPlatformViewController extends PlatformViewController with _Poi
   _CompositorPlatformViewController({required this.surface});
 
   void setSize(Size size) {
+    // Only track size for input coordinate calculations.
+    // NOTE: Size updates to compositor are now handled by WindowManager.
+    // WindowManager._syncSizeToCompositor() is the single source of truth for resize.
     this.size = size;
-    Compositor.compositor.platform.surfaceToplevelSetSize(surface, size.width.round(), size.height.round());
   }
 
   @override

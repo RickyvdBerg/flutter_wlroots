@@ -623,6 +623,10 @@ struct fwr_surface_render_data {
   const float *alpha;
   double content_scale_x;
   double content_scale_y;
+  int viewport_x;  // Output viewport offset for multi-monitor
+  int viewport_y;
+  int viewport_width;
+  int viewport_height;
 };
 
 struct fwr_rounded_clip {
@@ -645,6 +649,10 @@ struct fwr_rounded_render_data {
   double content_scale_x;
   double content_scale_y;
   struct fwr_rounded_clip rounded_clip;
+  int viewport_x;  // Output viewport offset for multi-monitor
+  int viewport_y;
+  int viewport_width;
+  int viewport_height;
 };
 
 static void render_surface_rounded_iterator(struct wlr_surface *surface, int sx, int sy, void *data) {
@@ -658,12 +666,13 @@ static void render_surface_rounded_iterator(struct wlr_surface *surface, int sx,
     return;
   }
 
-  int output_width = 1;
-  int output_height = 1;
-  if (instance->output != NULL && instance->output->wlr_output != NULL) {
-    output_width = instance->output->wlr_output->width;
-    output_height = instance->output->wlr_output->height;
-  }
+  // Use total output layout bounds for coordinate conversion
+  // Note: For multi-monitor, we still need to know total bounds for coordinate math,
+  // but we apply viewport offset to get per-output NDC coordinates
+  struct wlr_box total_box = {0};
+  wlr_output_layout_get_box(instance->output_layout, NULL, &total_box);
+  int output_width = total_box.width > 0 ? total_box.width : 1;
+  int output_height = total_box.height > 0 ? total_box.height : 1;
 
   double left = (double)sx * render_data->content_scale_x;
   double top = (double)sy * render_data->content_scale_y;
@@ -673,10 +682,18 @@ static void render_surface_rounded_iterator(struct wlr_surface *surface, int sx,
   struct wlr_box dst_box = flutter_transform_rect(render_data->transform, left, top, right, bottom);
   dst_box = scale_box(dst_box, render_data->output_scale);
 
-  float ndc_left = ((float)dst_box.x / (float)output_width) * 2.0f - 1.0f;
-  float ndc_right = ((float)(dst_box.x + dst_box.width) / (float)output_width) * 2.0f - 1.0f;
-  float ndc_top = 1.0f - ((float)dst_box.y / (float)output_height) * 2.0f;
-  float ndc_bottom = 1.0f - ((float)(dst_box.y + dst_box.height) / (float)output_height) * 2.0f;
+  // Apply viewport offset for multi-monitor rendering
+  dst_box.x -= render_data->viewport_x;
+  dst_box.y -= render_data->viewport_y;
+
+  // Use per-output dimensions for NDC conversion (stored in render_data)
+  int view_width = render_data->viewport_width > 0 ? render_data->viewport_width : output_width;
+  int view_height = render_data->viewport_height > 0 ? render_data->viewport_height : output_height;
+
+  float ndc_left = ((float)dst_box.x / (float)view_width) * 2.0f - 1.0f;
+  float ndc_right = ((float)(dst_box.x + dst_box.width) / (float)view_width) * 2.0f - 1.0f;
+  float ndc_top = 1.0f - ((float)dst_box.y / (float)view_height) * 2.0f;
+  float ndc_bottom = 1.0f - ((float)(dst_box.y + dst_box.height) / (float)view_height) * 2.0f;
 
   const GLfloat verts[8] = {
     ndc_right, ndc_bottom,
@@ -747,6 +764,11 @@ static void render_surface_iterator(struct wlr_surface *surface, int sx, int sy,
   struct wlr_box dst_box = flutter_transform_rect(render_data->transform, left, top, right, bottom);
   dst_box = scale_box(dst_box, render_data->output_scale);
 
+  // Apply viewport offset for multi-monitor rendering
+  // Each output shows its portion of the total Flutter surface
+  dst_box.x -= render_data->viewport_x;
+  dst_box.y -= render_data->viewport_y;
+
   enum wl_output_transform surface_transform = wlr_output_transform_invert(surface_state->transform);
 
   // Regular wlroots textured quad + optional (possibly rounded) pixman clip.
@@ -760,7 +782,7 @@ static void render_surface_iterator(struct wlr_surface *surface, int sx, int sy,
   });
 }
 
-static void render_scene_layer_platform(struct fwr_instance *instance, struct wlr_render_pass *render_pass, struct fwr_renderer_scene_layer *layer, struct timespec *now) {
+static void render_scene_layer_platform(struct fwr_instance *instance, struct wlr_render_pass *render_pass, struct fwr_renderer_scene_layer *layer, struct timespec *now, struct fwr_output_viewport *viewport) {
   uint32_t view_handle = layer->platform.platform_view_id;
   struct fwr_view *view;
   if (!handle_map_get(instance->views, view_handle, (void**) &view)) {
@@ -768,10 +790,24 @@ static void render_scene_layer_platform(struct fwr_instance *instance, struct wl
     return;
   }
 
+  // Use per-view output scale for multi-monitor support
+  // The view's current_output is updated when its position changes
   double output_scale = 1.0;
-  if (instance->output != NULL && instance->output->wlr_output != NULL) {
-    output_scale = instance->output->wlr_output->scale;
+  if (view->current_output != NULL && view->current_output->wlr_output != NULL) {
+    output_scale = view->current_output->wlr_output->scale;
+  } else {
+    // Fallback to first output for backwards compatibility
+    struct fwr_output *first_output = fwr_get_first_output(instance);
+    if (first_output != NULL && first_output->wlr_output != NULL) {
+      output_scale = first_output->wlr_output->scale;
+    }
   }
+
+  // Store viewport info for coordinate transformation
+  int viewport_x = viewport->x;
+  int viewport_y = viewport->y;
+  int viewport_width = viewport->width;
+  int viewport_height = viewport->height;
 
   // During fast interactive resize, Flutter can resize the PlatformView widget
   // before the client commits a new buffer, revealing the frame background on
@@ -779,6 +815,9 @@ static void render_scene_layer_platform(struct fwr_instance *instance, struct wl
   // last committed client buffer up to the widget size whenever the widget is
   // larger than the client buffer. When the client catches up, the scale
   // returns to 1.0 automatically.
+  //
+  // NOTE: This scaling should ONLY apply when there's a genuine size mismatch
+  // (e.g., during resize). Persistent scaling causes blur and rendering issues.
   double content_scale_x = 1.0;
   double content_scale_y = 1.0;
   int surf_w = view->xdg_surface->surface->current.width;
@@ -788,10 +827,12 @@ static void render_scene_layer_platform(struct fwr_instance *instance, struct wl
     double sy = layer->size.height / (double)surf_h;
 
     // Only scale up (this is what prevents "empty strip" on expansion).
-    if (isfinite(sx) && sx > 1.001) {
+    // Threshold increased to 1.01 (1% tolerance) to avoid micro-scaling
+    // due to floating point rounding in the Flutter->C path.
+    if (isfinite(sx) && sx > 1.01) {
       content_scale_x = sx;
     }
-    if (isfinite(sy) && sy > 1.001) {
+    if (isfinite(sy) && sy > 1.01) {
       content_scale_y = sy;
     }
 
@@ -801,6 +842,7 @@ static void render_scene_layer_platform(struct fwr_instance *instance, struct wl
     if (!isfinite(content_scale_y) || content_scale_y <= 0.0) {
       content_scale_y = 1.0;
     }
+    
   }
 
   float opacity = 1.0f;
@@ -968,6 +1010,10 @@ static void render_scene_layer_platform(struct fwr_instance *instance, struct wl
       .content_scale_x = content_scale_x,
       .content_scale_y = content_scale_y,
       .rounded_clip = rounded_clip,
+      .viewport_x = viewport_x,
+      .viewport_y = viewport_y,
+      .viewport_width = viewport_width,
+      .viewport_height = viewport_height,
     };
 
     wlr_surface_for_each_surface(view->xdg_surface->surface, render_surface_rounded_iterator, &rounded_render_data);
@@ -980,6 +1026,10 @@ static void render_scene_layer_platform(struct fwr_instance *instance, struct wl
       .alpha = &opacity,
       .content_scale_x = content_scale_x,
       .content_scale_y = content_scale_y,
+      .viewport_x = viewport_x,
+      .viewport_y = viewport_y,
+      .viewport_width = viewport_width,
+      .viewport_height = viewport_height,
     };
 
     wlr_surface_for_each_surface(view->xdg_surface->surface, render_surface_iterator, &render_data);
@@ -989,7 +1039,14 @@ static void render_scene_layer_platform(struct fwr_instance *instance, struct wl
     pixman_region32_fini(&clip_region);
   }
 
-  wlr_presentation_surface_textured_on_output(view->xdg_surface->surface, instance->output->wlr_output);
+  // Report presentation to the output where this surface is displayed
+  struct fwr_output *pres_output = view->current_output;
+  if (pres_output == NULL) {
+    pres_output = fwr_get_first_output(instance);  // Fallback
+  }
+  if (pres_output != NULL) {
+    wlr_presentation_surface_textured_on_output(view->xdg_surface->surface, pres_output->wlr_output);
+  }
   wlr_surface_send_frame_done(view->xdg_surface->surface, now);
 }
 
@@ -1194,8 +1251,10 @@ GLuint fwr_renderer_copy_texture(struct fwr_instance *instance,
   fns->glDisable(GL_BLEND);
   fns->glDisable(GL_SCISSOR_TEST);
 
-  // Only clear on allocation - subsequent copies overwrite entire texture
-  if (need_alloc) {
+  // Don't clear on resize - the draw will overwrite the entire texture anyway
+  // Clearing causes momentary black frames if there's a GPU sync race
+  // Only clear on first allocation (when cache dimensions are 0)
+  if (need_alloc && cache->width == 0 && cache->height == 0) {
     fns->glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
     fns->glClear(GL_COLOR_BUFFER_BIT);
   }
@@ -1237,6 +1296,17 @@ GLuint fwr_renderer_copy_texture(struct fwr_instance *instance,
   fns->glEnableVertexAttribArray(tex_attrib_loc);
 
   fns->glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+  // Check for GL errors after draw
+  GLenum draw_err = fns->glGetError();
+  if (draw_err != GL_NO_ERROR) {
+    wlr_log(WLR_ERROR, "GL error after draw: 0x%x", draw_err);
+  }
+
+  // Ensure GPU commands complete before returning
+  // glFinish waits for all commands to complete, preventing race conditions
+  // where Flutter reads the texture before our copy finishes
+  glFinish();
 
   fns->glDisableVertexAttribArray(pos_loc);
   fns->glDisableVertexAttribArray(tex_attrib_loc);
@@ -1395,6 +1465,7 @@ bool fwr_renderer_import_surface_dmabuf(struct fwr_instance *instance,
   struct fwr_renderer *renderer = &instance->fwr_renderer;
 
   if (!renderer->has_dmabuf_import) {
+    // This is normal for systems without DMA-BUF support
     return false;
   }
 
@@ -1406,6 +1477,7 @@ bool fwr_renderer_import_surface_dmabuf(struct fwr_instance *instance,
   // Get the client buffer from the surface
   struct wlr_client_buffer *client_buffer = surface->buffer;
   if (client_buffer == NULL || client_buffer->source == NULL) {
+    // Buffer not ready yet - common during transitions
     return false;
   }
 
@@ -1414,7 +1486,7 @@ bool fwr_renderer_import_surface_dmabuf(struct fwr_instance *instance,
   // Try to get DMA-BUF attributes from the source buffer
   struct wlr_dmabuf_attributes dmabuf_attribs;
   if (!wlr_buffer_get_dmabuf(source_buffer, &dmabuf_attribs)) {
-    // Not a DMA-BUF, fall back to copy path
+    // Not a DMA-BUF buffer (probably SHM) - caller will use wlroots texture fallback
     return false;
   }
 
@@ -1491,7 +1563,7 @@ bool fwr_renderer_import_surface_dmabuf(struct fwr_instance *instance,
   return true;
 }
 
-static void render_scene_layer_texture(struct fwr_instance *instance, struct wlr_render_pass *render_pass, struct fwr_renderer_scene_layer *layer) {
+static void render_scene_layer_texture(struct fwr_instance *instance, struct wlr_render_pass *render_pass, struct fwr_renderer_scene_layer *layer, struct fwr_output_viewport *viewport) {
   struct fwr_renderer *renderer = &instance->fwr_renderer;
 
   // We are on GLES2 backend, so we can cast wlr_renderer to access internal GLES2 functions if needed
@@ -1500,24 +1572,18 @@ static void render_scene_layer_texture(struct fwr_instance *instance, struct wlr
   // we will stick to the GL path for now but fix the coordinates.
   struct gl_fns *fns = &renderer->fns;
 
-  int output_width = 0;
-  int output_height = 0;
-  if (instance->output != NULL && instance->output->wlr_output != NULL) {
-    output_width = instance->output->wlr_output->width;
-    output_height = instance->output->wlr_output->height;
-  }
-
-  if (output_width <= 0 || output_height <= 0) {
-    output_width = 1;
-    output_height = 1;
-  }
+  // Use the specific output's viewport for coordinate mapping
+  // Each output shows only its portion of the total Flutter surface
+  int output_width = viewport->width > 0 ? viewport->width : 1;
+  int output_height = viewport->height > 0 ? viewport->height : 1;
 
   // Snap layer bounds to integer pixels to match platform-view rendering.
   // This prevents subtle frame/content desync while moving windows.
-  double x0 = floor(layer->offset.x);
-  double y0 = floor(layer->offset.y);
-  double x1 = ceil(layer->offset.x + layer->size.width);
-  double y1 = ceil(layer->offset.y + layer->size.height);
+  // Apply viewport offset to get coordinates relative to this output
+  double x0 = floor(layer->offset.x) - viewport->x;
+  double y0 = floor(layer->offset.y) - viewport->y;
+  double x1 = ceil(layer->offset.x + layer->size.width) - viewport->x;
+  double y1 = ceil(layer->offset.y + layer->size.height) - viewport->y;
 
   // Normalize coordinates to -1.0 to 1.0 (NDC)
   // Y-axis: Flutter (0 top) -> GL (-1 bottom, 1 top)
@@ -1562,7 +1628,7 @@ static void render_scene_layer_texture(struct fwr_instance *instance, struct wlr
   fns->glUseProgram(0);
 }
 
-void fwr_renderer_render_scene(struct fwr_instance *instance, struct wlr_render_pass *render_pass) {
+void fwr_renderer_render_scene(struct fwr_instance *instance, struct wlr_render_pass *render_pass, struct fwr_output_viewport *viewport) {
   struct fwr_renderer *renderer = &instance->fwr_renderer;
 
   struct timespec now;
@@ -1584,10 +1650,10 @@ void fwr_renderer_render_scene(struct fwr_instance *instance, struct wlr_render_
     struct fwr_renderer_scene_layer *layer = &renderer->current_scene.layers[i];
     switch (layer->type) {
     case sceneLayerPlatform:
-      render_scene_layer_platform(instance, render_pass, layer, &now);
+      render_scene_layer_platform(instance, render_pass, layer, &now, viewport);
       break;
     case sceneLayerTexture:
-      render_scene_layer_texture(instance, render_pass, layer);
+      render_scene_layer_texture(instance, render_pass, layer, viewport);
       break;
     }
   }
@@ -1612,7 +1678,7 @@ void fwr_renderer_update_scene_positions(struct fwr_instance *instance) {
     }
     // Position is set by surface_set_position platform channel message
     // Note: wlr_scene_xdg_surface handles geometry offset internally
-    int titlebar_offset = view->uses_ssd ? 38 : 0;
+    int titlebar_offset = view->uses_ssd ? FWR_SSD_TITLEBAR_HEIGHT : 0;
     wlr_scene_node_set_position(&view->scene_tree->node, view->x, view->y + titlebar_offset);
   }
 }

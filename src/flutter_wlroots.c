@@ -38,6 +38,8 @@
 #include <wlr/types/wlr_xcursor_manager.h>
 #include <wlr/types/wlr_matrix.h>
 #include <wlr/types/wlr_presentation_time.h>
+#include <wlr/render/dmabuf.h>
+#include <wlr/interfaces/wlr_buffer.h>
 #include <wlr/types/wlr_seat.h>
 #include <wlr/util/edges.h>
 #include <wlr/types/wlr_primary_selection_v1.h>
@@ -203,9 +205,15 @@ static void* engine_cb_renderer_gl_proc_resolve(void *user_data, const char *nam
 }
 
 // Helper function to provide texture for a wlr_surface
+// Two paths: DMA-BUF (preferred, zero-copy) or wlroots texture (fallback for SHM)
+//
+// Clean separation: Once buffer type is detected, we use only that path.
+// This avoids overhead from repeatedly trying DMA-BUF for SHM surfaces.
 static bool provide_surface_texture(struct fwr_instance *instance,
                                     struct wlr_surface *surface,
                                     struct fwr_cached_texture *cache,
+                                    size_t requested_width,
+                                    size_t requested_height,
                                     FlutterOpenGLTexture *texture_out) {
 #ifndef GL_RGBA8
 #define GL_RGBA8 0x8058
@@ -214,27 +222,73 @@ static bool provide_surface_texture(struct fwr_instance *instance,
 #define GL_TEXTURE_EXTERNAL_OES 0x8D65
 #endif
 
-  // Check for destroyed cache (race condition protection)
+  // Safety check for destroyed cache
   if (cache->destroyed) {
-    wlr_log(WLR_DEBUG, "Texture request for destroyed cache - surface likely being torn down");
     return false;
   }
 
-  // Try DMA-BUF zero-copy import first (preferred path)
-  if (fwr_renderer_import_surface_dmabuf(instance, surface, cache)) {
-    texture_out->target = cache->is_external ? GL_TEXTURE_EXTERNAL_OES : GL_TEXTURE_2D;
-    texture_out->name = cache->tex;
-    texture_out->format = GL_RGBA8;
-    texture_out->user_data = NULL;
-    texture_out->destruction_callback = NULL;
-    texture_out->width = cache->width;
-    texture_out->height = cache->height;
-    return true;
+  // Get actual buffer dimensions (the real texture size)
+  size_t actual_width = surface->current.buffer_width;
+  size_t actual_height = surface->current.buffer_height;
+
+  // Fallback to surface dimensions if buffer dimensions not available
+  if (actual_width == 0) actual_width = surface->current.width;
+  if (actual_height == 0) actual_height = surface->current.height;
+
+  // If dimensions are still 0, use cached fallback or fail
+  if (actual_width == 0 || actual_height == 0) {
+    wlr_log(WLR_DEBUG, "Zero dimensions: buffer=%dx%d surface=%dx%d, using cache",
+            surface->current.buffer_width, surface->current.buffer_height,
+            surface->current.width, surface->current.height);
+    if (cache->tex != 0 && cache->width > 0 && cache->height > 0) {
+      texture_out->target = GL_TEXTURE_2D;
+      texture_out->name = cache->tex;
+      texture_out->format = GL_RGBA8;
+      texture_out->user_data = NULL;
+      texture_out->destruction_callback = NULL;
+      texture_out->width = cache->width;
+      texture_out->height = cache->height;
+      return true;
+    }
+    return false;
   }
 
-  // Fall back to texture copy path
-  // Clean up any orphaned EGLImages from previous DMA-BUF path
-  // (happens when surface switches from DMA-BUF to SHM buffer)
+  // ========== DMA-BUF PATH ==========
+  // Only try DMA-BUF if we haven't determined it's SHM
+  if (cache->buffer_type != FWR_BUFFER_SHM) {
+    if (fwr_renderer_import_surface_dmabuf(instance, surface, cache)) {
+      // Mark as DMA-BUF surface for future frames
+      cache->buffer_type = FWR_BUFFER_DMABUF;
+
+      texture_out->target = cache->is_external ? GL_TEXTURE_EXTERNAL_OES : GL_TEXTURE_2D;
+      texture_out->name = cache->tex;
+      texture_out->format = GL_RGBA8;
+      texture_out->user_data = NULL;
+      texture_out->destruction_callback = NULL;
+      texture_out->width = actual_width;
+      texture_out->height = actual_height;
+      return true;
+    }
+
+    // DMA-BUF import failed - check if this is an SHM surface
+    // wlr_buffer_get_dmabuf returns false for SHM buffers
+    struct wlr_client_buffer *client_buffer = surface->buffer;
+    if (client_buffer != NULL && client_buffer->source != NULL) {
+      struct wlr_dmabuf_attributes dmabuf_attribs;
+      if (!wlr_buffer_get_dmabuf(client_buffer->source, &dmabuf_attribs)) {
+        // Confirmed SHM surface - mark it so we skip DMA-BUF next time
+        if (cache->buffer_type == FWR_BUFFER_UNKNOWN) {
+          cache->buffer_type = FWR_BUFFER_SHM;
+          wlr_log(WLR_INFO, "Surface detected as SHM, will use wlroots texture path");
+        }
+      }
+    }
+  }
+
+  // ========== SHM/WLROOTS PATH ==========
+  // For SHM buffers, use wlroots' texture (which handles SHM upload to GL)
+
+  // Clean up any stale DMA-BUF resources if we switched from DMA-BUF to SHM
   if (cache->current_egl_image != NULL) {
     struct fwr_renderer *renderer = &instance->fwr_renderer;
     pthread_mutex_lock(&renderer->texture_mutex);
@@ -244,67 +298,104 @@ static bool provide_surface_texture(struct fwr_instance *instance,
           renderer->eglDestroyImageKHR(instance->egl_display, cache->egl_cache[i].egl_image);
           cache->egl_cache[i].egl_image = NULL;
           cache->egl_cache[i].buffer = NULL;
-          cache->egl_cache[i].width = 0;
-          cache->egl_cache[i].height = 0;
         }
       }
     }
     cache->current_egl_image = NULL;
-    cache->egl_cache_next = 0;
-    // Reset texture state since we're switching paths - texture needs reallocation
     if (cache->tex != 0) {
       renderer->fns.glDeleteTextures(1, &cache->tex);
       cache->tex = 0;
     }
-    cache->is_external = false;
-    cache->tex_params_set = false;
     pthread_mutex_unlock(&renderer->texture_mutex);
   }
+
+  // Get wlroots' texture
   struct wlr_texture *wlr_tex = wlr_surface_get_texture(surface);
   if (wlr_tex == NULL) {
+    // No texture available - use cached fallback to prevent black frames
+    if (cache->tex != 0 && cache->width > 0 && cache->height > 0) {
+      wlr_log(WLR_DEBUG, "wlr_texture NULL, using cached %dx%d (requested %zux%zu)",
+              cache->width, cache->height, requested_width, requested_height);
+      texture_out->target = GL_TEXTURE_2D;
+      texture_out->name = cache->tex;
+      texture_out->format = GL_RGBA8;
+      texture_out->user_data = NULL;
+      texture_out->destruction_callback = NULL;
+      texture_out->width = cache->width;
+      texture_out->height = cache->height;
+      return true;
+    }
+    wlr_log(WLR_DEBUG, "wlr_texture NULL, no cache - returning false");
     return false;
-  }
-
-  // Check if content changed since last copy (optimization: skip copy if unchanged)
-  uint32_t current_seq = surface->current.seq;
-  if (cache->tex != 0 && cache->last_seq == current_seq &&
-      cache->width == surface->current.width &&
-      cache->height == surface->current.height &&
-      cache->current_egl_image == NULL) {  // Make sure we're not mixing DMA-BUF and copy paths
-    // Content unchanged - reuse cached texture
-    texture_out->target = GL_TEXTURE_2D;
-    texture_out->name = cache->tex;
-    texture_out->format = GL_RGBA8;
-    texture_out->user_data = NULL;
-    texture_out->destruction_callback = NULL;
-    texture_out->width = cache->width;
-    texture_out->height = cache->height;
-    return true;
   }
 
   struct wlr_gles2_texture_attribs attribs;
   wlr_gles2_texture_get_attribs(wlr_tex, &attribs);
 
-  // Copy texture to ensure Flutter compatibility
-  GLuint tex_2d = fwr_renderer_copy_texture(instance, attribs.tex, attribs.target,
-                                             surface->current.width,
-                                             surface->current.height,
-                                             cache);
-  if (tex_2d == 0) {
-    wlr_log(WLR_ERROR, "Copy failed for texture %d", attribs.tex);
+  // Check if the texture ID is valid
+  if (attribs.tex == 0) {
+    wlr_log(WLR_DEBUG, "wlr_texture has tex=0, using cached fallback");
+    if (cache->tex != 0 && cache->width > 0 && cache->height > 0) {
+      texture_out->target = GL_TEXTURE_2D;
+      texture_out->name = cache->tex;
+      texture_out->format = GL_RGBA8;
+      texture_out->user_data = NULL;
+      texture_out->destruction_callback = NULL;
+      texture_out->width = cache->width;
+      texture_out->height = cache->height;
+      return true;
+    }
     return false;
   }
 
-  // Update sequence tracking
-  cache->last_seq = current_seq;
+  // Log dimension mismatches during resize (helps debug flickering)
+  if (requested_width > 0 && requested_height > 0 &&
+      (requested_width != actual_width || requested_height != actual_height)) {
+    static int mismatch_count = 0;
+    if (mismatch_count++ % 30 == 0) {
+      wlr_log(WLR_DEBUG, "SHM resize: requested=%zux%zu actual=%zux%zu cache=%dx%d",
+              requested_width, requested_height, actual_width, actual_height,
+              cache->width, cache->height);
+    }
+  }
+
+  // Copy wlroots texture to our cached texture
+  // This ensures we have a stable texture during resize transitions
+  GLuint copied_tex = fwr_renderer_copy_texture(instance, attribs.tex, attribs.target,
+                                                 actual_width, actual_height, cache);
+  if (copied_tex == 0) {
+    // Copy failed - try cached fallback
+    wlr_log(WLR_DEBUG, "texture copy failed, trying cached fallback");
+    if (cache->tex != 0 && cache->width > 0 && cache->height > 0) {
+      texture_out->target = GL_TEXTURE_2D;
+      texture_out->name = cache->tex;
+      texture_out->format = GL_RGBA8;
+      texture_out->user_data = NULL;
+      texture_out->destruction_callback = NULL;
+      texture_out->width = cache->width;
+      texture_out->height = cache->height;
+      return true;
+    }
+    wlr_log(WLR_DEBUG, "no cached fallback available");
+    return false;
+  }
 
   texture_out->target = GL_TEXTURE_2D;
-  texture_out->name = tex_2d;
+  texture_out->name = copied_tex;
   texture_out->format = GL_RGBA8;
   texture_out->user_data = NULL;
   texture_out->destruction_callback = NULL;
-  texture_out->width = surface->current.width;
-  texture_out->height = surface->current.height;
+  texture_out->width = actual_width;
+  texture_out->height = actual_height;
+
+  // Log every texture provision during active resize (dimension mismatch)
+  if (requested_width > 0 && requested_height > 0 &&
+      (requested_width != actual_width || requested_height != actual_height)) {
+    static int frame_count = 0;
+    wlr_log(WLR_DEBUG, "FRAME %d: provided tex=%u %zux%zu for widget %zux%zu",
+            frame_count++, copied_tex, actual_width, actual_height,
+            requested_width, requested_height);
+  }
 
   return true;
 }
@@ -316,12 +407,16 @@ static bool engine_cb_external_texture(void *user_data, int64_t texture_id, size
   struct fwr_view *view = NULL;
   if (handle_map_get(instance->views, (uint32_t)texture_id, (void**)&view)) {
     if (view->xdg_surface == NULL || view->xdg_surface->surface == NULL) {
+      wlr_log(WLR_DEBUG, "texture_id=%ld: view surface NULL", texture_id);
       return false;
     }
-    // Per-frame logging - too verbose
-    // wlr_log(WLR_DEBUG, "External texture cb: view %d", view->handle);
-    return provide_surface_texture(instance, view->xdg_surface->surface,
-                                   &view->cache, texture_out);
+    // Pass Flutter's requested dimensions for resize smoothing
+    bool result = provide_surface_texture(instance, view->xdg_surface->surface,
+                                    &view->cache, width, height, texture_out);
+    if (!result) {
+      wlr_log(WLR_DEBUG, "texture_id=%ld: provide_surface_texture returned false", texture_id);
+    }
+    return result;
   }
 
   // If not a view, try to find a subsurface
@@ -333,8 +428,9 @@ static bool engine_cb_external_texture(void *user_data, int64_t texture_id, size
       if (sub->surface == NULL) {
         return false;
       }
+      // Subsurfaces use actual size (no resize smoothing needed)
       return provide_surface_texture(instance, sub->surface,
-                                     &sub->cache, texture_out);
+                                     &sub->cache, 0, 0, texture_out);
     }
   }
 
@@ -345,7 +441,6 @@ static bool engine_cb_external_texture(void *user_data, int64_t texture_id, size
     uint32_t popup_handle = (uint32_t)(texture_id - 200000);
     if (handle_map_get(instance->popups, popup_handle, (void**)&popup)) {
       if (popup->xdg_surface == NULL || popup->xdg_surface->surface == NULL) {
-        wlr_log(WLR_DEBUG, "Popup texture %ld: xdg_surface or surface is NULL", texture_id);
         return false;
       }
       struct wlr_surface *surf = popup->xdg_surface->surface;
@@ -364,37 +459,25 @@ static bool engine_cb_external_texture(void *user_data, int64_t texture_id, size
       struct wlr_surface *content_surface = surf;
       if (first_subsurface != NULL && first_subsurface->surface != NULL) {
         content_surface = first_subsurface->surface;
-        wlr_log(WLR_DEBUG, "Popup %d: using subsurface at (%d,%d) size %dx%d",
-                popup_handle,
-                first_subsurface->current.x, first_subsurface->current.y,
-                content_surface->current.width, content_surface->current.height);
       }
 
-      struct wlr_texture *wlr_tex = wlr_surface_get_texture(content_surface);
-      wlr_log(WLR_DEBUG, "Providing popup texture %ld (handle=%d), content_surface=%dx%d, wlr_texture=%p",
-              texture_id, popup_handle,
-              content_surface->current.width, content_surface->current.height,
-              (void*)wlr_tex);
-
-      if (wlr_tex == NULL) {
-        wlr_log(WLR_ERROR, "Popup texture %ld: wlr_surface_get_texture returned NULL", texture_id);
+      if (wlr_surface_get_texture(content_surface) == NULL) {
         return false;
       }
+
+      // Popups use actual size (no resize smoothing needed)
       bool result = provide_surface_texture(instance, content_surface,
-                                     &popup->cache, texture_out);
-      // Mark frame available again to ensure Flutter keeps requesting updates
-      // This ensures we catch subsurface content that arrives after initial request
+                                            &popup->cache, 0, 0, texture_out);
+      
+      // Keep requesting updates to catch subsurface content changes
       if (result && popup->texture_registered) {
         instance->fl_proc_table.MarkExternalTextureFrameAvailable(
             instance->engine, popup->texture_id);
       }
       return result;
-    } else {
-      wlr_log(WLR_DEBUG, "Popup texture %ld: handle %d not found in map", texture_id, popup_handle);
     }
   }
 
-  wlr_log(WLR_DEBUG, "External texture callback: texture %ld not found", texture_id);
   return false;
 }
 
@@ -484,6 +567,14 @@ static void engine_cb_platform_message(
       fwr_handle_surface_set_position(instance, engine_message->response_handle, &args);
       return;
     }
+    if (strcmp(method_name, "surface_request_resize") == 0) {
+      fwr_handle_surface_request_resize(instance, engine_message->response_handle, &args);
+      return;
+    }
+    if (strcmp(method_name, "surface_end_resize") == 0) {
+      fwr_handle_surface_end_resize(instance, engine_message->response_handle, &args);
+      return;
+    }
     if (strcmp(method_name, "surface_pointer_event") == 0) {
       fwr_handle_surface_pointer_event_message(instance, engine_message->response_handle, &args);
       return;
@@ -533,6 +624,17 @@ static void engine_cb_platform_message(
       return;
     }
 
+    // Dart signals it's ready to receive messages - send all existing outputs
+    if (strcmp(method_name, "compositor_ready") == 0) {
+      wlr_log(WLR_INFO, "Dart compositor ready, sending %d existing outputs",
+              wl_list_length(&instance->outputs));
+      fwr_send_all_outputs(instance);
+      instance->fl_proc_table.SendPlatformMessageResponse(
+          instance->engine, engine_message->response_handle,
+          method_call_null_success, sizeof(method_call_null_success));
+      return;
+    }
+
     if (strcmp(method_name, "get_socket_paths") == 0) {
       platch_respond_success_std(instance, (FlutterPlatformMessageResponseHandle *)engine_message->response_handle, &(struct std_value) {
         .type = kStdMap,
@@ -558,6 +660,129 @@ static void engine_cb_platform_message(
           }
         },
       });
+      return;
+    }
+
+    // Multi-monitor configuration commands
+    if (strcmp(method_name, "set_vsync_output") == 0) {
+      if (args.type == dvList && args.list.length >= 1) {
+        uint32_t output_id = 0;
+        if (args.list.values[0].type == dvInteger) {
+          output_id = (uint32_t)args.list.values[0].integer;
+        }
+        fwr_set_vsync_output(instance, output_id);
+      }
+      instance->fl_proc_table.SendPlatformMessageResponse(
+          instance->engine, engine_message->response_handle,
+          method_call_null_success, sizeof(method_call_null_success));
+      return;
+    }
+
+    if (strcmp(method_name, "set_vsync_rate_limit") == 0) {
+      if (args.type == dvList && args.list.length >= 1) {
+        int max_hz = 0;
+        if (args.list.values[0].type == dvInteger) {
+          max_hz = (int)args.list.values[0].integer;
+        }
+        fwr_set_vsync_rate_limit(instance, max_hz);
+      }
+      instance->fl_proc_table.SendPlatformMessageResponse(
+          instance->engine, engine_message->response_handle,
+          method_call_null_success, sizeof(method_call_null_success));
+      return;
+    }
+
+    if (strcmp(method_name, "set_output_mode") == 0) {
+      bool success = false;
+      if (args.type == dvList && args.list.length >= 4) {
+        uint32_t output_id = 0;
+        int width = 0, height = 0, refresh = 0;
+        if (args.list.values[0].type == dvInteger) {
+          output_id = (uint32_t)args.list.values[0].integer;
+        }
+        if (args.list.values[1].type == dvInteger) {
+          width = (int)args.list.values[1].integer;
+        }
+        if (args.list.values[2].type == dvInteger) {
+          height = (int)args.list.values[2].integer;
+        }
+        if (args.list.values[3].type == dvInteger) {
+          refresh = (int)args.list.values[3].integer;
+        }
+        success = fwr_set_output_mode(instance, output_id, width, height, refresh);
+      }
+      if (success) {
+        instance->fl_proc_table.SendPlatformMessageResponse(
+            instance->engine, engine_message->response_handle,
+            method_call_null_success, sizeof(method_call_null_success));
+      } else {
+        platch_respond_error_std(instance,
+            (FlutterPlatformMessageResponseHandle *)engine_message->response_handle,
+            "error", "Failed to set output mode", NULL);
+      }
+      return;
+    }
+
+    if (strcmp(method_name, "set_output_position") == 0) {
+      bool success = false;
+      if (args.type == dvList && args.list.length >= 3) {
+        uint32_t output_id = 0;
+        int x = 0, y = 0;
+        if (args.list.values[0].type == dvInteger) {
+          output_id = (uint32_t)args.list.values[0].integer;
+        }
+        if (args.list.values[1].type == dvInteger) {
+          x = (int)args.list.values[1].integer;
+        }
+        if (args.list.values[2].type == dvInteger) {
+          y = (int)args.list.values[2].integer;
+        }
+        success = fwr_set_output_position(instance, output_id, x, y);
+      }
+      if (success) {
+        instance->fl_proc_table.SendPlatformMessageResponse(
+            instance->engine, engine_message->response_handle,
+            method_call_null_success, sizeof(method_call_null_success));
+      } else {
+        platch_respond_error_std(instance,
+            (FlutterPlatformMessageResponseHandle *)engine_message->response_handle,
+            "error", "Failed to set output position", NULL);
+      }
+      return;
+    }
+
+    if (strcmp(method_name, "set_output_scale") == 0) {
+      bool success = false;
+      if (args.type == dvList && args.list.length >= 2) {
+        uint32_t output_id = 0;
+        double scale = 1.0;
+        if (args.list.values[0].type == dvInteger) {
+          output_id = (uint32_t)args.list.values[0].integer;
+        }
+        if (args.list.values[1].type == dvFloat64) {
+          scale = args.list.values[1].f64;
+        } else if (args.list.values[1].type == dvInteger) {
+          scale = (double)args.list.values[1].integer;
+        }
+        success = fwr_set_output_scale(instance, output_id, scale);
+      }
+      if (success) {
+        instance->fl_proc_table.SendPlatformMessageResponse(
+            instance->engine, engine_message->response_handle,
+            method_call_null_success, sizeof(method_call_null_success));
+      } else {
+        platch_respond_error_std(instance,
+            (FlutterPlatformMessageResponseHandle *)engine_message->response_handle,
+            "error", "Failed to set output scale", NULL);
+      }
+      return;
+    }
+
+    if (strcmp(method_name, "set_primary_output") == 0) {
+      // Primary output is tracked on the Dart side only
+      instance->fl_proc_table.SendPlatformMessageResponse(
+          instance->engine, engine_message->response_handle,
+          method_call_null_success, sizeof(method_call_null_success));
       return;
     }
 
@@ -681,6 +906,12 @@ bool fwr_instance_create(struct fwr_instance_opts opts, struct fwr_instance **in
   instance->scene = wlr_scene_create();
   instance->scene_output_layout = wlr_scene_attach_output_layout(instance->scene, instance->output_layout);
   instance->flutter_scene_buffer = NULL;
+
+  // Initialize multi-output support
+  wl_list_init(&instance->outputs);
+  instance->vsync_output = NULL;
+  instance->next_output_id = 0;
+  instance->vsync_rate_limit = 0;
 
   // XDG output manager - provides output info to clients (needed by grim, etc.)
   wlr_xdg_output_manager_v1_create(instance->wl_display, instance->output_layout);
@@ -806,15 +1037,23 @@ bool fwr_instance_create(struct fwr_instance_opts opts, struct fwr_instance **in
     wlr_log(WLR_ERROR, "Flutter Engine Run failed!");
   }
 
-  if (instance->output != NULL) {
+  // Note: Outputs are sent to Flutter when Dart signals "compositor_ready"
+  // This ensures Dart's message handlers are registered before we send data
+
+  // Send initial window metrics based on total output bounds
+  if (!wl_list_empty(&instance->outputs)) {
+    struct wlr_box total_box = {0};
+    wlr_output_layout_get_box(instance->output_layout, NULL, &total_box);
+
     FlutterWindowMetricsEvent window_metrics = {};
     window_metrics.struct_size = sizeof(FlutterWindowMetricsEvent);
-    window_metrics.width = instance->output->wlr_output->width;
-    window_metrics.height = instance->output->wlr_output->height;
-    // Keep Flutter's coordinate space consistent with wlroots output scale.
-    // Setting this incorrectly can produce fractional layer offsets and
-    // transform translations that don't match (visible as subtle desync/jitter).
-    window_metrics.pixel_ratio = instance->output->wlr_output->scale;
+    window_metrics.width = total_box.width;
+    window_metrics.height = total_box.height;
+    // Keep Flutter's coordinate space consistent - use 1.0 for multi-output
+    // Individual outputs may have different scales, handled per-output
+    window_metrics.pixel_ratio = 1.0;
+    wlr_log(WLR_INFO, "Sending Flutter window metrics: %dx%d, pixel_ratio=%.2f",
+            total_box.width, total_box.height, window_metrics.pixel_ratio);
     instance->fl_proc_table.SendWindowMetricsEvent(instance->engine, &window_metrics);
   }
 

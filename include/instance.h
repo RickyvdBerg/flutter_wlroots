@@ -24,6 +24,10 @@ struct wlr_scene_tree;
 struct wlr_scene_rect;
 struct wlr_output_layout_output;
 
+// Server-side decoration (SSD) titlebar height in pixels.
+// Must match WindowDecoration.titleBarHeight in Dart (pangolin_desktop).
+#define FWR_SSD_TITLEBAR_HEIGHT 38
+
 // EGLImage cache entry for triple-buffered DMA-BUF surfaces
 #define FWR_EGLIMAGE_CACHE_SIZE 4
 struct fwr_eglimage_cache_entry {
@@ -31,6 +35,13 @@ struct fwr_eglimage_cache_entry {
   void *egl_image;            // EGLImageKHR
   int width;                  // Buffer dimensions (for invalidation on resize)
   int height;
+};
+
+// Buffer type for clean render path separation
+enum fwr_buffer_type {
+  FWR_BUFFER_UNKNOWN,  // First frame, haven't determined type yet
+  FWR_BUFFER_DMABUF,   // Uses DMA-BUF (zero-copy EGLImage path)
+  FWR_BUFFER_SHM       // Uses SHM (wlroots texture copy path)
 };
 
 // Cached texture for zero-copy DMA-BUF texture sharing
@@ -43,6 +54,7 @@ struct fwr_cached_texture {
   bool is_external;     // True if texture requires GL_TEXTURE_EXTERNAL_OES
   bool tex_params_set;  // True if texture parameters have been configured
   bool destroyed;       // True if texture has been destroyed (for race detection)
+  enum fwr_buffer_type buffer_type;  // Detected buffer type (DMA-BUF or SHM)
 
   // EGLImage cache for triple-buffering (avoids recreating EGLImage every frame)
   struct fwr_eglimage_cache_entry egl_cache[FWR_EGLIMAGE_CACHE_SIZE];
@@ -84,6 +96,8 @@ struct fwr_instance {
   struct wlr_cursor *cursor;
   struct wlr_xcursor_manager *cursor_mgr;
   char *current_xcursor_name;  // Current xcursor name for software rendering
+  struct wlr_texture *xcursor_texture;  // Cached xcursor texture for software rendering
+  char *xcursor_texture_name;  // Name of the cached xcursor texture
   struct wlr_surface *client_cursor_surface;  // Client-provided cursor surface
   int32_t client_cursor_hotspot_x;
   int32_t client_cursor_hotspot_y;
@@ -114,7 +128,13 @@ struct fwr_instance {
   struct wlr_scene *scene;
   struct wlr_scene_output_layout *scene_output_layout;
   struct wlr_scene_buffer *flutter_scene_buffer;
-  struct fwr_output *output;
+
+  // Multi-output support
+  struct wl_list outputs;              // List of fwr_output
+  struct fwr_output *vsync_output;     // Output that drives Flutter vsync (highest refresh or user-selected)
+  uint32_t next_output_id;             // Counter for generating unique output IDs
+  int vsync_rate_limit;                // 0 = unlimited, >0 = max Hz (for power saving)
+
   struct wl_listener new_output;
 
   FlutterEngineProcTable fl_proc_table;
@@ -139,8 +159,9 @@ struct fwr_instance {
 };
 
 struct fwr_output {
-	struct wl_list link;
+  struct wl_list link;
 
+  uint32_t id;  // Unique output ID for platform channel communication
   struct wlr_output *wlr_output;
   struct wlr_scene_output *scene_output;
   struct wlr_output_layout_output *layout_output;
@@ -149,7 +170,18 @@ struct fwr_output {
   struct wl_listener frame;
   struct wl_listener request_state;
   struct wl_listener present;
+  struct wl_listener destroy;  // Handle monitor disconnect/hotplug
 };
+
+// Helper to get first output from list (for backwards compatibility)
+// Returns NULL if no outputs are connected
+static inline struct fwr_output *fwr_get_first_output(struct fwr_instance *instance) {
+  if (wl_list_empty(&instance->outputs)) {
+    return NULL;
+  }
+  struct fwr_output *first;
+  return wl_container_of(instance->outputs.next, first, link);
+}
 
 struct fwr_view {
   struct wl_list link;
@@ -163,6 +195,10 @@ struct fwr_view {
   int y;
   int width;
   int height;
+
+  // Multi-monitor support: track which output this view is on
+  struct fwr_output *current_output;  // Cached output for this surface
+  double output_scale;                // Cached scale (for rendering)
 
   // Geometry offset - where visible content starts within the buffer
   // Used by CSD apps that include shadows in their buffer
@@ -204,6 +240,13 @@ struct fwr_view {
   struct wl_listener request_resize;
   struct wl_listener request_minimize;
   struct wl_listener request_maximize;
+
+  // Synchronized resize state - delays widget resize until client commits matching buffer
+  bool resize_in_progress;           // True during interactive resize
+  uint32_t pending_configure_serial; // Serial we're waiting for ack (unused for now, reserved)
+  int pending_width;                 // Requested content width
+  int pending_height;                // Requested content height
+  uint64_t resize_request_id;        // Dart's request ID for correlation
 };
 
 struct fwr_keyboard {
@@ -228,6 +271,10 @@ struct fwr_subsurface {
 
   int x, y;             // Position relative to parent
   int width, height;
+
+  // Multi-monitor support: inherit output from parent
+  struct fwr_output *current_output;
+  double output_scale;
 
   int64_t texture_id;
   bool texture_registered;
@@ -255,6 +302,10 @@ struct fwr_popup {
   // Position relative to parent (from xdg_positioner)
   int x, y;
   int width, height;
+
+  // Multi-monitor support: inherit output from parent
+  struct fwr_output *current_output;
+  double output_scale;
 
   // Scene tree for wlroots rendering and input handling
   struct wlr_scene_tree *scene_tree;

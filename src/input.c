@@ -323,12 +323,11 @@ static void on_server_cursor_touch_down(struct wl_listener *listener, void *data
   state->touch_points[event->touch_id].x = event->x;
   state->touch_points[event->touch_id].y = event->y;
 
-  double screen_width = 1.0;
-  double screen_height = 1.0;
-  if (instance->output != NULL) {
-    screen_width = instance->output->wlr_output->width;
-    screen_height = instance->output->wlr_output->height;
-  }
+  // Get total output layout bounds for touch coordinate conversion
+  struct wlr_box total_box = {0};
+  wlr_output_layout_get_box(instance->output_layout, NULL, &total_box);
+  double screen_width = total_box.width > 0 ? total_box.width : 1.0;
+  double screen_height = total_box.height > 0 ? total_box.height : 1.0;
 
   wlr_log(WLR_INFO, "touch down %f %f", event->x, event->y);
 
@@ -361,12 +360,11 @@ static void on_server_cursor_touch_up(struct wl_listener *listener, void *data) 
 
   if (event->touch_id >= FWR_MULTITOUCH_MAX) return;
 
-  double screen_width = 1.0;
-  double screen_height = 1.0;
-  if (instance->output != NULL) {
-    screen_width = instance->output->wlr_output->width;
-    screen_height = instance->output->wlr_output->height;
-  }
+  // Get total output layout bounds for touch coordinate conversion
+  struct wlr_box total_box = {0};
+  wlr_output_layout_get_box(instance->output_layout, NULL, &total_box);
+  double screen_width = total_box.width > 0 ? total_box.width : 1.0;
+  double screen_height = total_box.height > 0 ? total_box.height : 1.0;
 
   FlutterPointerEvent pointer_event = {};
   pointer_event.struct_size = sizeof(FlutterPointerEvent);
@@ -399,12 +397,11 @@ static void on_server_cursor_touch_motion(struct wl_listener *listener, void *da
   state->touch_points[event->touch_id].x = event->x;
   state->touch_points[event->touch_id].y = event->y;
 
-  double screen_width = 1.0;
-  double screen_height = 1.0;
-  if (instance->output != NULL) {
-    screen_width = instance->output->wlr_output->width;
-    screen_height = instance->output->wlr_output->height;
-  }
+  // Get total output layout bounds for touch coordinate conversion
+  struct wlr_box total_box = {0};
+  wlr_output_layout_get_box(instance->output_layout, NULL, &total_box);
+  double screen_width = total_box.width > 0 ? total_box.width : 1.0;
+  double screen_height = total_box.height > 0 ? total_box.height : 1.0;
 
   FlutterPointerEvent pointer_event = {};
   pointer_event.struct_size = sizeof(FlutterPointerEvent);
@@ -562,12 +559,15 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
     if (modifiers & WLR_MODIFIER_LOGO) {
       struct fwr_instance *instance = keyboard->instance;
       struct fwr_view *view = get_focused_view(instance);
-      if (view == NULL || instance->output == NULL) {
+      if (view == NULL || wl_list_empty(&instance->outputs)) {
         return;
       }
 
-      int output_width = instance->output->wlr_output->width;
-      int output_height = instance->output->wlr_output->height;
+      // Use first output dimensions for window tiling
+      // TODO: Use output where window is located for multi-monitor
+      struct fwr_output *first_output = fwr_get_first_output(instance);
+      int output_width = first_output->wlr_output->width;
+      int output_height = first_output->wlr_output->height;
 
       if (sym == XKB_KEY_Left || sym == XKB_KEY_Right) {
         view->maximized = false;

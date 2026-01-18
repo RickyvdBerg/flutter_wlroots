@@ -3,11 +3,15 @@ library compositor_dart;
 import 'dart:async';
 import 'dart:collection';
 import 'dart:io';
+import 'dart:ui';
 
 import 'package:compositor_dart/constants.dart';
+import 'package:compositor_dart/src/output.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:logging/logging.dart';
+
+export 'package:compositor_dart/src/output.dart';
 
 enum KeyStatus { released, pressed }
 
@@ -47,6 +51,21 @@ class SurfaceMaximizeEvent {
   SurfaceMaximizeEvent({
     required this.handle,
     required this.maximized,
+  });
+}
+
+/// Event fired when a client commits a buffer matching the requested resize size.
+/// Used for synchronized resize to prevent black flickering.
+class ResizeReadyEvent {
+  final int handle;
+  final int requestId;
+  final int width;
+  final int height;
+  ResizeReadyEvent({
+    required this.handle,
+    required this.requestId,
+    required this.width,
+    required this.height,
   });
 }
 
@@ -105,6 +124,14 @@ class Surface {
   /// This can be updated after surface_map when decoration negotiation completes.
   bool usesCsd;
 
+  /// Multi-monitor support: ID of the output (monitor) this surface is on.
+  /// 0 means no specific output assigned.
+  int outputId;
+
+  /// Multi-monitor support: scale factor of the output this surface is on.
+  /// Used for correct rendering on HiDPI displays.
+  double outputScale;
+
   /// List of subsurfaces belonging to this surface
   final List<Subsurface> subsurfaces = [];
 
@@ -126,6 +153,8 @@ class Surface {
     this.geoX = 0,
     this.geoY = 0,
     this.usesCsd = false,
+    this.outputId = 0,
+    this.outputScale = 1.0,
   });
 }
 
@@ -141,6 +170,14 @@ class Popup {
   int width;
   int height;
 
+  /// Multi-monitor support: ID of the output (monitor) this popup is on.
+  /// Inherited from parent surface.
+  int outputId;
+
+  /// Multi-monitor support: scale factor of the output this popup is on.
+  /// Used for correct rendering on HiDPI displays.
+  double outputScale;
+
   Popup({
     required this.handle,
     required this.textureId,
@@ -150,6 +187,8 @@ class Popup {
     this.y = 0,
     this.width = 0,
     this.height = 0,
+    this.outputId = 0,
+    this.outputScale = 1.0,
   });
 }
 
@@ -206,16 +245,23 @@ class _CompositorPlatform {
     await channel.invokeMethod("surface_clear_focus", [surface.handle]);
   }
 
-  Future<void> surfaceBeginMove(Surface surface) async {
-    await channel.invokeListMethod("surface_begin_move", [surface.handle]);
-  }
-
-  Future<void> surfaceBeginResize(Surface surface, int edges) async {
-    await channel.invokeListMethod("surface_begin_resize", [surface.handle, edges]);
-  }
+  // NOTE: surfaceBeginMove and surfaceBeginResize have been removed.
+  // Move/resize is now fully Dart-controlled via WindowManager in avio_wm.
+  // Position/size updates are sent via surfaceSetPosition and surfaceToplevelSetSize.
 
   Future<void> surfaceSetPosition(Surface surface, int x, int y) async {
     await channel.invokeListMethod("surface_set_position", [surface.handle, x, y]);
+  }
+
+  /// Request a synchronized resize - waits for client to commit matching buffer.
+  /// Returns immediately, resize_ready event is sent when client complies.
+  Future<void> surfaceRequestResize(int handle, int width, int height, int requestId) async {
+    await channel.invokeListMethod("surface_request_resize", [handle, width, height, requestId]);
+  }
+
+  /// Signal end of interactive resize operation.
+  Future<void> surfaceEndResize(int handle) async {
+    await channel.invokeListMethod("surface_end_resize", [handle]);
   }
 
   /// Enable direct input mode for low-latency gaming.
@@ -266,10 +312,16 @@ class Compositor {
   HashMap<int, Surface> surfaces = HashMap();
   HashMap<int, Subsurface> subsurfaces = HashMap();
   HashMap<int, Popup> popups = HashMap();
+  HashMap<int, DisplayOutput> outputs = HashMap();
 
   // Emits an event when a surface has been added and is ready to be presented on the screen.
   StreamController<Surface> surfaceMapped = StreamController.broadcast();
   StreamController<Surface> surfaceUnmapped = StreamController.broadcast();
+
+  // Output events (multi-monitor support)
+  StreamController<DisplayOutput> outputAdded = StreamController.broadcast();
+  StreamController<int> outputRemoved = StreamController.broadcast();
+  StreamController<DisplayOutput> outputChanged = StreamController.broadcast();
 
   // Popup events (menus, dropdowns, tooltips)
   StreamController<Popup> popupMapped = StreamController.broadcast();
@@ -286,6 +338,9 @@ class Compositor {
   // CSD app requests - when client-side decoration apps request window state changes
   StreamController<Surface> surfaceMinimizeRequested = StreamController.broadcast();
   StreamController<SurfaceMaximizeEvent> surfaceMaximizeRequested = StreamController.broadcast();
+
+  // Synchronized resize events - fired when client commits matching buffer
+  StreamController<ResizeReadyEvent> resizeReady = StreamController.broadcast();
 
   int? keyToXkb(int physicalKey) => physicalToXkbMap[physicalKey];
 
@@ -309,8 +364,10 @@ class Compositor {
         geoX: call.arguments["geo_x"] ?? 0,
         geoY: call.arguments["geo_y"] ?? 0,
         usesCsd: (call.arguments["uses_csd"] ?? 0) != 0,
+        outputId: call.arguments["output_id"] ?? 0,
+        outputScale: (call.arguments["output_scale"] as num?)?.toDouble() ?? 1.0,
       );
-      print("Surface mapped: handle=${surface.handle}, size=${surface.width}x${surface.height}, buffer=${surface.bufferWidth}x${surface.bufferHeight}, geoOffset=(${surface.geoX},${surface.geoY}), usesCsd=${surface.usesCsd}");
+      print("Surface mapped: handle=${surface.handle}, size=${surface.width}x${surface.height}, buffer=${surface.bufferWidth}x${surface.bufferHeight}, geoOffset=(${surface.geoX},${surface.geoY}), usesCsd=${surface.usesCsd}, outputId=${surface.outputId}, outputScale=${surface.outputScale}");
       surfaces[surface.handle] = surface;
       surfaceMapped.add(surface);
     });
@@ -395,6 +452,8 @@ class Compositor {
       int width = call.arguments["width"] ?? 0;
       int height = call.arguments["height"] ?? 0;
       int textureId = call.arguments["texture_id"] ?? (handle + 200000);
+      int outputId = call.arguments["output_id"] ?? 0;
+      double outputScale = (call.arguments["output_scale"] as num?)?.toDouble() ?? 1.0;
 
       Popup popup = Popup(
         handle: handle,
@@ -405,9 +464,11 @@ class Compositor {
         y: y,
         width: width,
         height: height,
+        outputId: outputId,
+        outputScale: outputScale,
       );
 
-      print("Popup mapped: handle=$handle, parent=$parentHandle, pos=($x,$y), size=${width}x$height, textureId=$textureId");
+      print("Popup mapped: handle=$handle, parent=$parentHandle, pos=($x,$y), size=${width}x$height, textureId=$textureId, outputId=$outputId, outputScale=$outputScale");
       popups[handle] = popup;
       popupMapped.add(popup);
     });
@@ -518,6 +579,92 @@ class Compositor {
         maximized: maximized,
       ));
     });
+
+    // Synchronized resize: client committed buffer matching requested size
+    platform.addHandler("resize_ready", (call) async {
+      int handle = call.arguments["handle"];
+      int requestId = call.arguments["request_id"];
+      int width = call.arguments["width"];
+      int height = call.arguments["height"];
+      print("Resize ready: handle=$handle, requestId=$requestId, size=${width}x$height");
+      resizeReady.add(ResizeReadyEvent(
+        handle: handle,
+        requestId: requestId,
+        width: width,
+        height: height,
+      ));
+    });
+
+    // Output (monitor) handlers for multi-monitor support
+    platform.addHandler("output_added", (call) async {
+      final args = call.arguments as Map<dynamic, dynamic>;
+      final output = DisplayOutput.fromArgs(args);
+
+      // Primary is the output at position (0,0) - the leftmost/topmost monitor
+      // This handles outputs being registered in any order
+      if (output.x == 0 && output.y == 0) {
+        // New output is at origin - make it primary, demote others
+        for (final existing in outputs.values) {
+          existing.isPrimary = false;
+        }
+        output.isPrimary = true;
+      } else if (outputs.isEmpty) {
+        // First output and not at origin - make primary for now
+        // Will be demoted if origin output is added later
+        output.isPrimary = true;
+      }
+
+      outputs[output.id] = output;
+      print("Output added: $output");
+      outputAdded.add(output);
+    });
+
+    platform.addHandler("output_removed", (call) async {
+      final args = call.arguments as Map<dynamic, dynamic>;
+      final outputId = args['id'] as int;
+
+      final output = outputs[outputId];
+      if (output == null) return;
+
+      outputs.remove(outputId);
+      print("Output removed: $outputId ($output)");
+      outputRemoved.add(outputId);
+
+      // If primary was removed, make another output primary
+      if (output.isPrimary && outputs.isNotEmpty) {
+        outputs.values.first.isPrimary = true;
+        outputChanged.add(outputs.values.first);
+      }
+    });
+
+    platform.addHandler("output_changed", (call) async {
+      final args = call.arguments as Map<dynamic, dynamic>;
+      final outputId = args['id'] as int;
+
+      final output = outputs[outputId];
+      if (output == null) return;
+
+      output.updateFrom(args);
+      print("Output changed: $output");
+      outputChanged.add(output);
+    });
+
+    // Signal to C that Dart is ready to receive messages
+    // This triggers sending of existing outputs that were detected before Dart initialized
+    _signalReady();
+  }
+
+  void _signalReady() {
+    // Use Future.microtask to ensure all constructor initialization is complete
+    // and handlers are registered before signaling ready
+    Future.microtask(() async {
+      try {
+        await platform.channel.invokeMethod("compositor_ready");
+        print("Compositor ready signal sent to C");
+      } catch (e) {
+        print("Error sending compositor_ready: $e");
+      }
+    });
   }
 
   /// Returns `true` if we are currently running in the compositor embedder.
@@ -540,4 +687,148 @@ class Compositor {
 
   /// Will return the paths of the compositor sockets.
   Future<CompositorSockets> getSocketPaths() => platform.getSocketPaths();
+
+  // ============== Multi-Monitor Support ==============
+
+  /// Get the primary display output.
+  DisplayOutput? get primaryOutput =>
+      outputs.values.cast<DisplayOutput?>().firstWhere(
+            (o) => o?.isPrimary == true,
+            orElse: () => outputs.values.isNotEmpty ? outputs.values.first : null,
+          );
+
+  /// Get total bounds across all outputs (unified coordinate space).
+  Rect get totalBounds {
+    if (outputs.isEmpty) {
+      return Rect.zero;
+    }
+
+    int minX = outputs.values.map((o) => o.x).reduce((a, b) => a < b ? a : b);
+    int minY = outputs.values.map((o) => o.y).reduce((a, b) => a < b ? a : b);
+    int maxX = outputs.values.map((o) => o.x + o.width).reduce((a, b) => a > b ? a : b);
+    int maxY = outputs.values.map((o) => o.y + o.height).reduce((a, b) => a > b ? a : b);
+
+    return Rect.fromLTRB(
+      minX.toDouble(),
+      minY.toDouble(),
+      maxX.toDouble(),
+      maxY.toDouble(),
+    );
+  }
+
+  /// Get the output containing a given point.
+  DisplayOutput? getOutputAtPoint(double x, double y) {
+    for (final output in outputs.values) {
+      if (output.containsPoint(x, y)) {
+        return output;
+      }
+    }
+    return null;
+  }
+
+  /// Get the output that contains most of the given rectangle.
+  DisplayOutput? getOutputForRect(Rect rect) {
+    DisplayOutput? bestOutput;
+    double bestOverlap = 0;
+
+    for (final output in outputs.values) {
+      final outputRect = Rect.fromLTWH(
+        output.x.toDouble(),
+        output.y.toDouble(),
+        output.width.toDouble(),
+        output.height.toDouble(),
+      );
+
+      final intersection = rect.intersect(outputRect);
+      if (!intersection.isEmpty) {
+        final overlap = intersection.width * intersection.height;
+        if (overlap > bestOverlap) {
+          bestOverlap = overlap;
+          bestOutput = output;
+        }
+      }
+    }
+
+    return bestOutput ?? primaryOutput;
+  }
+
+  /// Set which output is primary.
+  /// Returns true on success, false on failure.
+  Future<bool> setPrimaryOutput(int outputId) async {
+    try {
+      for (final output in outputs.values) {
+        output.isPrimary = output.id == outputId;
+      }
+      await platform.channel.invokeMethod("set_primary_output", [outputId]);
+      return true;
+    } on PlatformException catch (e) {
+      print('Failed to set primary output: $e');
+      return false;
+    }
+  }
+
+  /// Set which output drives Flutter's vsync (0 = auto/highest refresh).
+  /// Returns true on success, false on failure.
+  Future<bool> setVsyncOutput(int outputId) async {
+    try {
+      await platform.channel.invokeMethod("set_vsync_output", [outputId]);
+      return true;
+    } on PlatformException catch (e) {
+      print('Failed to set vsync output: $e');
+      return false;
+    }
+  }
+
+  /// Set vsync rate limit for power saving (0 = unlimited, >0 = max Hz).
+  /// Returns true on success, false on failure.
+  Future<bool> setVsyncRateLimit(int maxHz) async {
+    try {
+      await platform.channel.invokeMethod("set_vsync_rate_limit", [maxHz]);
+      return true;
+    } on PlatformException catch (e) {
+      print('Failed to set vsync rate limit: $e');
+      return false;
+    }
+  }
+
+  /// Set output mode (resolution and refresh rate).
+  /// Returns true on success, false on failure.
+  Future<bool> setOutputMode(int outputId, DisplayMode mode) async {
+    try {
+      await platform.channel.invokeMethod("set_output_mode", [
+        outputId,
+        mode.width,
+        mode.height,
+        mode.refresh,
+      ]);
+      return true;
+    } on PlatformException catch (e) {
+      print('Failed to set output mode: $e');
+      return false;
+    }
+  }
+
+  /// Set output position in the layout.
+  /// Returns true on success, false on failure.
+  Future<bool> setOutputPosition(int outputId, int x, int y) async {
+    try {
+      await platform.channel.invokeMethod("set_output_position", [outputId, x, y]);
+      return true;
+    } on PlatformException catch (e) {
+      print('Failed to set output position: $e');
+      return false;
+    }
+  }
+
+  /// Set output scale factor.
+  /// Returns true on success, false on failure.
+  Future<bool> setOutputScale(int outputId, double scale) async {
+    try {
+      await platform.channel.invokeMethod("set_output_scale", [outputId, scale]);
+      return true;
+    } on PlatformException catch (e) {
+      print('Failed to set output scale: $e');
+      return false;
+    }
+  }
 }

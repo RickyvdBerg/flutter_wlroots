@@ -16,3 +16,7 @@ void fwr_handle_surface_set_position(struct fwr_instance *instance, const Flutte
 void fwr_focus_view(struct fwr_view *view);
 void fwr_send_decoration_update(struct fwr_view *view);
 void fwr_new_xdg_popup(struct wl_listener *listener, void *data);
+
+// Synchronized resize handlers
+void fwr_handle_surface_request_resize(struct fwr_instance *instance, const FlutterPlatformMessageResponseHandle *handle, struct dart_value *args);
+void fwr_handle_surface_end_resize(struct fwr_instance *instance, const FlutterPlatformMessageResponseHandle *handle, struct dart_value *args);
